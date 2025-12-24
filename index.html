@@ -1,6 +1,6 @@
+<!-- this UI module is largely courtesy of AI help; but the inference, BPE and training were human written line by line -->
 <!DOCTYPE html>
 <html lang="en">
-<!-- this UI module is largely courtesy of AI help -->
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -10,6 +10,7 @@
 
     <script src="./inference/inference_webgpu.js"></script>
     <script src="./inference/inference_helper_webgpu.js"></script>
+    <script src="./inference/inference_bpe.js"></script>
 
     <style>
         /* --- Basic Setup & Typography --- */
@@ -524,6 +525,12 @@
             color: var(--primary-color);
         }
         
+        /* Special styling for actual token option in teacher mode */
+        .actual-token-option:hover .token-probability {
+            color: white !important;
+            opacity: 1;
+        }
+        
         /* --- Token Probability Display --- */
         .token-with-prob {
             display: inline-flex;
@@ -815,9 +822,22 @@
         </div>
 
         <!-- New: Write Story from Scratch -->
-        <!-- TEMPORARILY HIDDEN: Write from scratch button -->
-        <div class="write-story-section hidden" style="margin-top: 25px; text-align: center; font-size: 0.95em; color: var(--text-muted);">
-            <button id="write-story-btn" style="padding: 12px 24px; font-size: 0.95em; font-weight: 600; border: 2px solid var(--border-color); background-color: white; cursor: pointer; border-radius: 10px; transition: all 0.2s ease; box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.1);">Or begin a story from scratch...</button>
+        <div class="write-story-section" style="margin-top: 25px; text-align: center; font-size: 0.95em; color: var(--text-muted);">
+            <button id="write-story-btn" style="padding: 12px 24px; font-size: 0.95em; font-weight: 600; border: 2px solid var(--border-color); background-color: white; cursor: pointer; border-radius: 10px; transition: all 0.2s ease; box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.1);">Or enter your own story text...</button>
+        </div>
+        
+        <!-- Custom Story Text Input Modal -->
+        <div id="custom-story-modal" class="hidden" style="position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); display: flex; justify-content: center; align-items: center; z-index: 1000;">
+            <div style="background: white; padding: 30px; border-radius: 16px; max-width: 600px; width: 90%; box-shadow: var(--shadow-xl);">
+                <h2 style="margin-top: 0; text-align: center; color: var(--text-color);">Enter Your Story Text</h2>
+                <textarea id="custom-story-textarea" placeholder="Type or paste your story text here..." style="width: 100%; min-height: 200px; padding: 15px; border-radius: 10px; border: 2px solid var(--border-color); font-family: var(--font-family); font-size: 1em; box-sizing: border-box; resize: vertical;"></textarea>
+                <p id="custom-story-warning" style="color: #ef4444; font-size: 0.9em; margin: 10px 0; display: none;"></p>
+                <p style="color: var(--text-muted); font-size: 0.85em; margin: 10px 0;">Note: Characters not in the vocabulary will be replaced with spaces.</p>
+                <div style="display: flex; justify-content: flex-end; gap: 15px; margin-top: 20px;">
+                    <button id="custom-story-cancel" style="padding: 12px 24px; font-size: 1em; font-weight: 600; border: 2px solid var(--border-color); background-color: white; cursor: pointer; border-radius: 10px;">Cancel</button>
+                    <button id="custom-story-submit" style="padding: 12px 24px; font-size: 1em; font-weight: 600; border: none; background: linear-gradient(135deg, var(--primary-color) 0%, var(--primary-dark) 100%); color: white; cursor: pointer; border-radius: 10px;">Use This Text</button>
+                </div>
+            </div>
         </div>
 
         <!-- Section 3: Inference Mode Selection (Initially Hidden) -->
@@ -874,6 +894,10 @@
                 <div class="show-probabilities-control">
                     <input type="checkbox" id="show-probabilities-checkbox">
                     <label for="show-probabilities-checkbox">Show token probabilities</label>
+                    <span id="show-rank-control" class="hidden" style="margin-left: 20px;">
+                        <input type="checkbox" id="show-rank-checkbox">
+                        <label for="show-rank-checkbox">Show token rank</label>
+                    </span>
                 </div>
                 <div id="output-area">The model's response will appear here.</div>
 
@@ -913,6 +937,7 @@
             ffnDimMultiplier: 4,
             numTransformers: 4,
         };
+        globalThis.SEQUENCE_LENGTH = 256;
         if (!globalThis.vocab) globalThis.vocab = null;
         if (!globalThis.tokenizedStories) globalThis.tokenizedStories = {};
         if (!globalThis.tokenEmbeddings_GLOBAL) globalThis.tokenEmbeddings_GLOBAL = null;
@@ -953,6 +978,8 @@
         const $editContextCheckbox = $('#edit-context-checkbox');
         
         const $showProbabilitiesCheckbox = $('#show-probabilities-checkbox');
+        const $showRankCheckbox = $('#show-rank-checkbox');
+        const $showRankControl = $('#show-rank-control');
         
         const $modelLoadingIndicator = $('#model-loading-indicator');
         const $modelLoadingStatus = $('#model-loading-status');
@@ -1146,7 +1173,7 @@
                 // Initialize LM network objects after model is loaded
                 globalThis.lmNetwork = new LmNetwork();
                 await lmNetwork.init();
-                lmNetwork.setupInference(256);
+                lmNetwork.setupInference(SEQUENCE_LENGTH);
 
                 console.log('✓ LM network objects initialized');
                 
@@ -1323,7 +1350,7 @@
                 // Initialize LM network objects after model is loaded
                 globalThis.lmNetwork = new LmNetwork();
                 await lmNetwork.init();
-                lmNetwork.setupInference(256);
+                lmNetwork.setupInference(SEQUENCE_LENGTH);
 
                 
                 console.log('✓ LM network objects initialized');
@@ -1450,9 +1477,13 @@
                 updateSelectionText();
             }
             
-            // Auto-select "show probabilities" for teacher-forced mode
+            // Auto-select "show probabilities" for teacher-forced mode and show rank option
             if (currentInferenceConfig.type === 'teacher-forced') {
                 $showProbabilitiesCheckbox.prop('checked', true);
+                $showRankControl.removeClass('hidden');
+            } else {
+                $showRankControl.addClass('hidden');
+                $showRankCheckbox.prop('checked', false);
             }
         }
         
@@ -1506,18 +1537,125 @@
         
         // --- Write Story from Scratch Handlers ---
         
-        $writeStoryBtn.on('click', function() {
-            fullStoryText = '';
-            currentInferenceConfig = { type: 'free-inference', percentage: 0 };
-            isFromScratch = true; // User chose "from scratch"
+        // Helper function to normalize quotes and collapse multiple newlines
+        function normalizeText(text) {
+            // Replace fancy double quotes with standard double quote
+            let normalized = text.replace(/[\u201C\u201D\u201E\u201F\u2033\u2036]/g, '"');
+            // Replace fancy single quotes with standard single quote
+            normalized = normalized.replace(/[\u2018\u2019\u201A\u201B\u2032\u2035]/g, "'");
+            // Collapse multiple newlines to single newline
+            normalized = normalized.replace(/\n{2,}/g, '\n');
+            return normalized;
+        }
+        
+        // Helper function to sanitize text by replacing non-vocab characters with spaces
+        function sanitizeTextForVocab(text) {
+            // First normalize quotes and collapse newlines
+            let processedText = normalizeText(text);
             
-            // Hide sections
+            let sanitizedText = '';
+            let replacedChars = [];
+            
+            for (let i = 0; i < processedText.length; i++) {
+                const char = processedText[i];
+                // Check if the character is in the vocabulary
+                if (globalThis.tokenValsRecord[char] === undefined) {
+                    // Replace with space if not in vocab
+                    sanitizedText += ' ';
+                    if (!replacedChars.includes(char)) {
+                        replacedChars.push(char);
+                    }
+                } else {
+                    sanitizedText += char;
+                }
+            }
+            
+            return { sanitizedText, replacedChars };
+        }
+        
+        // Process custom story text: validate, sanitize, and tokenize
+        function processCustomStoryText(text) {            
+            // Sanitize the text (replace non-vocab chars with spaces)
+            const { sanitizedText, replacedChars } = sanitizeTextForVocab(text);
+            
+            if (replacedChars.length > 0) {
+                console.log('Replaced non-vocab characters:', replacedChars);
+            }
+            
+            // Tokenize using BPE
+            const tokens = globalThis.bpeTextSequence(sanitizedText);
+            console.log('Tokenized text into', tokens.length, 'tokens');
+            
+            // Truncate to SEQUENCE_LENGTH if necessary
+            const truncatedTokens = tokens.slice(0, SEQUENCE_LENGTH);
+            if (tokens.length > SEQUENCE_LENGTH) {
+                console.log(`Truncated from ${tokens.length} to ${SEQUENCE_LENGTH} tokens`);
+            }
+            
+            return { sanitizedText, tokens: truncatedTokens, replacedChars };
+        }
+        
+        $writeStoryBtn.on('click', function() {
+            // Show the custom story modal
+            $('#custom-story-modal').removeClass('hidden').css('display', 'flex');
+            $('#custom-story-textarea').val('').focus();
+            $('#custom-story-warning').hide();
+        });
+        
+        // Cancel button in modal
+        $('#custom-story-cancel').on('click', function() {
+            $('#custom-story-modal').addClass('hidden').css('display', 'none');
+        });
+        
+        // Submit button in modal - process text and go to teacher mode
+        $('#custom-story-submit').on('click', async function() {
+            const rawText = $('#custom-story-textarea').val();
+            
+            if (!rawText.trim()) {
+                $('#custom-story-warning').text('Please enter some text.').show();
+                return;
+            }
+            
+            // Ensure vocab is loaded
+            await loadVocab();
+            
+            // Process the text
+            const { sanitizedText, tokens, replacedChars } = processCustomStoryText(rawText);
+            
+            // Show warning if characters were replaced
+            if (replacedChars.length > 0) {
+                const charList = replacedChars.map(c => `"${c}"`).join(', ');
+                $('#custom-story-warning').text(`Note: Replaced unsupported characters: ${charList}`).show();
+            }
+            
+            // Check if we have any tokens
+            if (tokens.length === 0) {
+                $('#custom-story-warning').text('No valid tokens could be created from this text.').show();
+                return;
+            }
+            
+            // Store the tokens as fullStoryTokens (like we do for loaded stories)
+            fullStoryTokens = tokens;
+            fullStoryText = sanitizedText;
+            isFromScratch = false; // Not "from scratch" anymore - we have tokenized content
+            
+            console.log('Custom story processed:', tokens.length, 'tokens');
+            
+            // Hide the modal
+            $('#custom-story-modal').addClass('hidden').css('display', 'none');
+            
+            // Hide story section and show mode selection (like loading a story)
             $storySection.addClass('hidden');
             $configSection.addClass('hidden');
             $('.write-story-section').addClass('hidden');
-            
-            // Skip mode selection, go directly to inference
-            setupInferenceUI();
+            $modeSelectionSection.removeClass('hidden');
+        });
+        
+        // Close modal when clicking outside
+        $('#custom-story-modal').on('click', function(e) {
+            if (e.target === this) {
+                $(this).addClass('hidden').css('display', 'none');
+            }
         });
         
         // --- Inference Mode Selection Handlers ---
@@ -1595,6 +1733,14 @@
                 }
             }
         });
+        
+        // Handle rank display toggle (teacher mode only)
+        $showRankCheckbox.on('change', function() {
+            // Re-render the output with or without ranks
+            if (generatedTokens.length > 0 && currentInferenceConfig.type === 'teacher-forced') {
+                renderInteractiveOutput(teacherModeFirstToken, generatedTokens);
+            }
+        });
 
         // Handle the main "Generate" button click
         $generateBtn.on('click', async function() {
@@ -1629,7 +1775,6 @@
             }
 
             const mode = $('input[name="mode"]:checked').val();
-            const SEQUENCE_LENGTH = 256; // Fixed at 256
 
             try {
                 // Determine input tokens based on whether we're using tokenized story or text
@@ -1702,7 +1847,7 @@
         
         // Teacher Forced Mode: validate model predictions against actual next tokens
         async function runTeacherForcedInference(contextTokens, numContextTokens, SEQUENCE_LENGTH) {
-            // Pad to 256 tokens
+            // Pad to SEQUENCE_LENGTH tokens (e.g., 256)
             let inputTokens = [...contextTokens];
             if (inputTokens.length < SEQUENCE_LENGTH) {
                 const paddingNeeded = SEQUENCE_LENGTH - inputTokens.length;
@@ -1782,6 +1927,9 @@
                 // Sort by probability descending
                 predictionsWithIndices.sort((a, b) => b.val - a.val);
                 
+                // Find the rank of the actual token (1-indexed)
+                const actualTokenRank = predictionsWithIndices.findIndex(p => p.originalIndex === actualNextTokenVocabIndex) + 1;
+                
                 // Get top 10
                 const top10 = predictionsWithIndices.slice(0, 10);
                 
@@ -1791,10 +1939,12 @@
                     probability: pred.val
                 }));
                 
-                // Store token data
+                // Store token data with actual token probability and rank for teacher mode
                 generatedTokens.push({
                     value: actualNextTokenStr,
-                    topPredictions: topPredictions
+                    topPredictions: topPredictions,
+                    actualTokenProbability: modelConfidence, // Store actual token probability separately
+                    actualTokenRank: actualTokenRank // Store actual token rank (1 to vocabSize)
                 });
             }
             
@@ -1824,13 +1974,13 @@
             // Initialize working array with context tokens
             let currentTokens = [...contextTokens];
             
-            // Pad to 256 if needed
+            // Pad to SEQUENCE_LENGTH if needed (e.g., 256)
             if (currentTokens.length < SEQUENCE_LENGTH) {
                 const paddingNeeded = SEQUENCE_LENGTH - currentTokens.length;
                 const padding = Array(paddingNeeded).fill('?');
                 currentTokens = currentTokens.concat(padding);
             } else if (currentTokens.length > SEQUENCE_LENGTH) {
-                // If context is longer than 256, slice to exactly 256
+                // If context is longer than SEQUENCE_LENGTH, slice to exactly SEQUENCE_LENGTH
                 currentTokens = currentTokens.slice(0, SEQUENCE_LENGTH);
                 console.log(`Context truncated to ${SEQUENCE_LENGTH} tokens`);
             }
@@ -1838,9 +1988,9 @@
             const numRealTokensStart = Math.min(numContextTokens, SEQUENCE_LENGTH);
             generatedTokens = [];
             
-            // Generate tokens iteratively until we reach 257 total tokens
-            // rightEndIndex goes from numContextTokens-1 to 255 (inclusive)
-            // This generates tokens at positions numContextTokens through 256 (257 total tokens)
+            // Generate tokens iteratively until we reach SEQUENCE_LENGTH+1 total tokens
+            // rightEndIndex goes from numContextTokens-1 to SEQUENCE_LENGTH-1 (e.g., 255) inclusive
+            // This generates tokens at positions numContextTokens through SEQUENCE_LENGTH (e.g., 256), giving SEQUENCE_LENGTH+1 (e.g., 257) total tokens
             const maxIterations = SEQUENCE_LENGTH - numRealTokensStart + 1;
             console.log(`Will generate up to ${maxIterations} tokens`);
             
@@ -1900,16 +2050,16 @@
                 
                 // Update UI in batches of 3 tokens or at the end
                 tokensSinceLastUpdate++;
-                const isLastIteration = rightEndIndex >= 255 || iteration === maxIterations - 1;
+                const isLastIteration = rightEndIndex >= (SEQUENCE_LENGTH - 1) || iteration === maxIterations - 1;
                 
                 if (tokensSinceLastUpdate >= BATCH_SIZE || isLastIteration) {
                     renderFreeInferenceOutput(contextTokens, generatedTokens, true); // true = disable tooltips during generation
                     tokensSinceLastUpdate = 0;
                 }
                 
-                // Stop if we've reached rightEndIndex of 255 (which gives us the 257th token)
-                if (rightEndIndex >= 255) {
-                    console.log(`Reached rightEndIndex of 255. Generated token at position 256 (257th token). Stopping.`);
+                // Stop if we've reached rightEndIndex of SEQUENCE_LENGTH-1 (e.g., 255) which gives us the final token
+                if (rightEndIndex >= SEQUENCE_LENGTH - 1) {
+                    console.log(`Reached rightEndIndex of ${SEQUENCE_LENGTH - 1}. Generated token at position ${SEQUENCE_LENGTH} (${SEQUENCE_LENGTH + 1}th token). Stopping.`);
                     break;
                 }
             }
@@ -2006,18 +2156,37 @@
             }
             
             const showProbabilities = $showProbabilitiesCheckbox.is(':checked');
+            const showRank = $showRankCheckbox.is(':checked');
+            const isTeacherMode = currentInferenceConfig.type === 'teacher-forced';
             
             // Create interactive spans for each predicted token
             tokens.forEach((tokenData, index) => {
-                if (showProbabilities && tokenData.topPredictions && tokenData.topPredictions.length > 0) {
-                    // Show token with probability label above
+                const hasTeacherData = tokenData.actualTokenProbability !== undefined;
+                const shouldShowLabel = (showProbabilities || (showRank && hasTeacherData)) && tokenData.topPredictions && tokenData.topPredictions.length > 0;
+                
+                if (shouldShowLabel) {
+                    // Show token with label above
                     const $wrapper = $('<span>').addClass('token-with-prob');
                     
-                    // Get the probability of the actual token (first in topPredictions)
-                    const actualProb = tokenData.topPredictions[0].probability;
+                    // Build label text based on what's checked
+                    let labelText = '';
+                    if (showRank && hasTeacherData) {
+                        labelText = '#' + tokenData.actualTokenRank;
+                        if (showProbabilities) {
+                            const actualProb = tokenData.actualTokenProbability;
+                            labelText += ' (' + (actualProb * 100).toFixed(1) + '%)';
+                        }
+                    } else if (showProbabilities) {
+                        // Use actualTokenProbability if available (teacher mode), otherwise use top prediction
+                        const actualProb = hasTeacherData 
+                            ? tokenData.actualTokenProbability 
+                            : tokenData.topPredictions[0].probability;
+                        labelText = (actualProb * 100).toFixed(1) + '%';
+                    }
+                    
                     const $probLabel = $('<span>')
                         .addClass('token-prob-label')
-                        .text((actualProb * 100).toFixed(1) + '%');
+                        .text(labelText);
                     
                     const $token = $('<span>')
                         .addClass('token')
@@ -2083,7 +2252,45 @@
                 $('<div>').addClass('token-tooltip-header').text('Top Token Predictions')
             );
             
-            // Token options
+            // In teacher mode, show actual token first with special styling
+            if (tokenData.actualTokenProbability !== undefined) {
+                const $actualOption = $('<div>')
+                    .addClass('token-option')
+                    .addClass('actual-token-option')
+                    .css({
+                        'background-color': '#e0f2fe',
+                        'border-left': '3px solid #0284c7'
+                    });
+                
+                $actualOption.append(
+                    $('<span>').addClass('token-rank').text('#' + tokenData.actualTokenRank).css({
+                        'background': '#0c4a6e',
+                        'color': 'white',
+                        'font-weight': '700'
+                    })
+                );
+                
+                $actualOption.append(
+                    $('<span>').addClass('token-value').text(tokenData.value).css('font-weight', '600')
+                );
+                
+                $actualOption.append(
+                    $('<span>').addClass('token-probability')
+                        .text((tokenData.actualTokenProbability * 100).toFixed(2) + '%')
+                        .css('color', '#0284c7')
+                );
+                
+                $tooltip.append($actualOption);
+                
+                // Add a small divider
+                $tooltip.append($('<div>').css({
+                    'height': '1px',
+                    'background': '#e2e8f0',
+                    'margin': '4px 0'
+                }));
+            }
+            
+            // Token options (top 10 predictions)
             tokenData.topPredictions.forEach((pred, rank) => {
                 const $option = $('<div>')
                     .addClass('token-option')
@@ -2288,16 +2495,16 @@
                 
                 // Update UI in batches
                 tokensSinceLastUpdate++;
-                const isLastIteration = rightEndIndex >= 255 || iteration === maxIterations - 1;
+                const isLastIteration = rightEndIndex >= (SEQUENCE_LENGTH - 1) || iteration === maxIterations - 1;
                 
                 if (tokensSinceLastUpdate >= BATCH_SIZE || isLastIteration) {
                     renderFreeInferenceOutput(freeInferenceContextTokens, generatedTokens, true);
                     tokensSinceLastUpdate = 0;
                 }
                 
-                // Stop if we've reached rightEndIndex of 255
-                if (rightEndIndex >= 255) {
-                    console.log(`Reached rightEndIndex of 255. Stopping.`);
+                // Stop if we've reached rightEndIndex of SEQUENCE_LENGTH-1 (e.g., 255)
+                if (rightEndIndex >= (SEQUENCE_LENGTH - 1)) {
+                    console.log(`Reached rightEndIndex of ${SEQUENCE_LENGTH - 1}. Stopping.`);
                     break;
                 }
             }
