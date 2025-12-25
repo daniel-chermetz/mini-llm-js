@@ -840,6 +840,22 @@
             </div>
         </div>
 
+        <!-- Model Selector Modal -->
+        <div id="model-selector-modal" class="hidden" style="position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.6); display: flex; justify-content: center; align-items: center; z-index: 1001;">
+            <div style="background: white; padding: 35px; border-radius: 16px; max-width: 450px; width: 90%; box-shadow: var(--shadow-xl);">
+                <h2 style="margin-top: 0; text-align: center; color: var(--text-color);">Select Model Snapshot</h2>
+                <p style="color: var(--text-muted); font-size: 0.9em; text-align: center; margin-bottom: 10px;">Choose a model checkpoint to load:</p>
+                <p style="color: var(--text-color); font-size: 0.85em; font-weight: 600; text-align: center; margin-bottom: 20px; line-height: 1.4; background: #f0f4f8; padding: 12px; border-radius: 8px;">Model 5 is the most advanced snapshot, especially effective when using word replacement to correct generation. However, result quality varies by prompt—earlier snapshots (1-4) can sometimes produce better results for specific inputs.</p>
+                <div id="model-options" style="display: flex; flex-direction: column; gap: 10px;">
+                    <button class="model-option-btn" data-model="model_11_lr_1e5.bin" style="padding: 14px 20px; font-size: 1em; font-weight: 600; border: 2px solid var(--border-color); background-color: white; cursor: pointer; border-radius: 10px; transition: all 0.2s ease;">Model 1 - lr 1e-5</button>
+                    <button class="model-option-btn" data-model="model_12_lr_4e6.bin" style="padding: 14px 20px; font-size: 1em; font-weight: 600; border: 2px solid var(--border-color); background-color: white; cursor: pointer; border-radius: 10px; transition: all 0.2s ease;">Model 2 - lr 4e-6</button>
+                    <button class="model-option-btn" data-model="model_13_lr_3e6.bin" style="padding: 14px 20px; font-size: 1em; font-weight: 600; border: 2px solid var(--border-color); background-color: white; cursor: pointer; border-radius: 10px; transition: all 0.2s ease;">Model 3 - lr 3e-6</button>
+                    <button class="model-option-btn" data-model="model_14_lr_3e6.bin" style="padding: 14px 20px; font-size: 1em; font-weight: 600; border: 2px solid var(--border-color); background-color: white; cursor: pointer; border-radius: 10px; transition: all 0.2s ease;">Model 4 - lr 3e-6</button>
+                    <button class="model-option-btn" data-model="model_15_lr_3e6.bin" style="padding: 14px 20px; font-size: 1em; font-weight: 600; border: 2px solid var(--border-color); background-color: white; cursor: pointer; border-radius: 10px; transition: all 0.2s ease;">Model 5 - lr 3e-6</button>
+                </div>
+            </div>
+        </div>
+
         <!-- Section 3: Inference Mode Selection (Initially Hidden) -->
         <div id="mode-selection-section" class="mode-selection-section hidden">
             <h2>Step 2: Choose Inference Mode</h2>
@@ -938,6 +954,7 @@
             numTransformers: 4,
         };
         globalThis.SEQUENCE_LENGTH = 256;
+        globalThis.SHOW_MODEL_SELECTOR = true; // Set to true to show model selection modal on startup
         if (!globalThis.vocab) globalThis.vocab = null;
         if (!globalThis.tokenizedStories) globalThis.tokenizedStories = {};
         if (!globalThis.tokenEmbeddings_GLOBAL) globalThis.tokenEmbeddings_GLOBAL = null;
@@ -994,7 +1011,7 @@
             if (globalThis.vocab) return globalThis.vocab;
             
             try {
-                const response = await fetch('./vocab.json');
+                const response = await fetch('./model/vocab.json');
                 globalThis.vocab = await response.json();
                 
                 // Check if it's an array or object
@@ -2581,15 +2598,62 @@
                 alert('Failed to load vocabulary. Please refresh the page.');
             }
             
-            // Load model weights asynchronously (don't await - let it load in background)
-            loadModelWeights('./model/model.bin').then(success => {
+            // Check if model selector should be shown
+            if (globalThis.SHOW_MODEL_SELECTOR) {
+                // Show model selector modal and wait for selection
+                $('#model-selector-modal').removeClass('hidden').css('display', 'flex');
+            } else {
+                // Load default model weights asynchronously (don't await - let it load in background)
+                loadModelWeights('./model/model_15_lr_3e6.bin').then(success => {
+                    if (success) {
+                        console.log('✓ Model weights ready');
+                    } else {
+                        console.error('✗ Failed to load model weights');
+                    }
+                });
+            }
+
+            /*loadJSONModelWeights('./model/model35.json').then(success => {
                 if (success) {
-                    console.log('✓ Model weights ready');
+                    console.log('✓ JSON Model weights ready');
                 } else {
-                    console.error('✗ Failed to load model weights');
+                    console.error('✗ Failed to load JSON model weights');
+                }
+            });*/
+        }
+        
+        // Model selector button handlers
+        $('.model-option-btn').on('click', function() {
+            const modelFile = $(this).data('model');
+            console.log(`Selected model: ${modelFile}`);
+            
+            // Hide the modal
+            $('#model-selector-modal').addClass('hidden').css('display', 'none');
+            
+            // Load the selected model
+            loadModelWeights(`./model/${modelFile}`).then(success => {
+                if (success) {
+                    console.log(`✓ Model ${modelFile} loaded successfully`);
+                } else {
+                    console.error(`✗ Failed to load model ${modelFile}`);
                 }
             });
-        }
+        });
+        
+        // Add hover effect for model buttons
+        $('.model-option-btn').on('mouseenter', function() {
+            $(this).css({
+                'background': 'linear-gradient(135deg, var(--primary-color) 0%, var(--primary-dark) 100%)',
+                'color': 'white',
+                'border-color': 'var(--primary-color)'
+            });
+        }).on('mouseleave', function() {
+            $(this).css({
+                'background': 'white',
+                'color': 'var(--text-color)',
+                'border-color': 'var(--border-color)'
+            });
+        });
         
         initialize();
     });
