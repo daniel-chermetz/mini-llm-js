@@ -950,13 +950,13 @@
         // --- Global Data Storage ---
         globalThis.NetworkMeta = {
             dimensions: 512,
-            heads: 8,
+            heads: 4,
             ropeDenomBase: 10000,
             ffnDimMultiplier: 4,
-            numTransformers: 4,
+            numTransformers: 8,
         };
         globalThis.SEQUENCE_LENGTH = 256;
-        globalThis.SHOW_MODEL_SELECTOR = true; // Set to true to show model selection modal on startup
+        globalThis.SHOW_MODEL_SELECTOR = false; // Set to true to show model selection modal on startup
         if (!globalThis.vocab) globalThis.vocab = null;
         if (!globalThis.tokenizedStories) globalThis.tokenizedStories = {};
         if (!globalThis.tokenEmbeddings_GLOBAL) globalThis.tokenEmbeddings_GLOBAL = null;
@@ -1386,6 +1386,509 @@
                 
             } catch (error) {
                 console.error(`!!! Error loading model from '${filename}':`, error);
+                updateModelLoadingProgress(0, `Error: ${error.message}`);
+                
+                // Change styling to show error
+                $modelLoadingIndicator.css('border-color', '#ef4444');
+                $modelProgressFill.css('background', 'linear-gradient(135deg, #ef4444 0%, #dc2626 100%)');
+                
+                return false;
+            }
+        }
+        
+        // Load model weights from binary format (V2 - CUDA column-major format)
+        // This loader handles column-major data saved by the CUDA trainer
+        async function loadModelWeightsV2(filename) {
+            console.log(`--- Attempting to load binary model weights (V2/CUDA format) from ${filename}... ---`);
+            
+            // Show loading indicator
+            $modelLoadingIndicator.removeClass('hidden');
+            updateModelLoadingProgress(0, 'Fetching model file...');
+            
+            try {
+                // Fetch the model file
+                const response = await fetch(filename);
+                
+                if (!response.ok) {
+                    throw new Error(`Failed to fetch model: ${response.status} ${response.statusText}`);
+                }
+                
+                // Get content length for progress tracking
+                const contentLength = response.headers.get('content-length');
+                const total = contentLength ? parseInt(contentLength, 10) : 0;
+                
+                updateModelLoadingProgress(10, 'Downloading model...');
+                
+                // Read the response body with progress
+                let received = 0;
+                const reader = response.body.getReader();
+                const chunks = [];
+                
+                while (true) {
+                    const { done, value } = await reader.read();
+                    
+                    if (done) break;
+                    
+                    chunks.push(value);
+                    received += value.length;
+                    
+                    // Update progress (10% to 70% for download)
+                    if (total > 0) {
+                        const downloadProgress = 10 + (received / total) * 60;
+                        updateModelLoadingProgress(downloadProgress, `Downloading: ${(received / 1024 / 1024).toFixed(1)} MB`);
+                    }
+                }
+                
+                updateModelLoadingProgress(70, 'Parsing binary data...');
+                
+                // Combine chunks into a single Uint8Array
+                const allChunks = new Uint8Array(received);
+                let position = 0;
+                for (const chunk of chunks) {
+                    allChunks.set(chunk, position);
+                    position += chunk.length;
+                }
+                
+                // Convert to ArrayBuffer for DataView operations
+                const fileBuffer = allChunks.buffer;
+                const dataView = new DataView(fileBuffer);
+                
+                updateModelLoadingProgress(75, 'Reading header...');
+                
+                // Read header
+                const headerLength = dataView.getBigUint64(0, true); // true = little-endian
+                const headerStart = 8;
+                const headerEnd = headerStart + Number(headerLength);
+                
+                if (headerEnd > fileBuffer.byteLength) {
+                    throw new Error('Header length specified in file is larger than the file itself.');
+                }
+                
+                const headerBuffer = allChunks.slice(headerStart, headerEnd);
+                const metadata = JSON.parse(new TextDecoder('utf-8').decode(headerBuffer));
+                
+                updateModelLoadingProgress(80, 'Processing tensors (V2 format)...');
+                
+                // Calculate where the data payload starts, accounting for potential padding
+                const ALIGNMENT = 8;
+                const paddingNeeded = (ALIGNMENT - (headerEnd % ALIGNMENT)) % ALIGNMENT;
+                let dataOffset = headerEnd + paddingNeeded;
+                
+                // Read tensor from column-major format and convert to row-major JS arrays
+                // For a 2D tensor stored column-major with shape [rows, cols]:
+                // - Element at (row, col) is at index: col * rows + row
+                // - We want to read into row-major: row * cols + col
+                const readTensorColumnMajorToRowMajor = (tensorMeta) => {
+                    const numElements = tensorMeta.shape.reduce((acc, val) => acc * val, 1);
+                    let bytesPerElement;
+                    
+                    if (tensorMeta.dtype === 'float32') { bytesPerElement = 4; }
+                    else if (tensorMeta.dtype === 'float64') { bytesPerElement = 8; }
+                    else { throw new Error(`Unsupported dtype: ${tensorMeta.dtype}`); }
+                    
+                    const byteLength = numElements * bytesPerElement;
+                    if (dataOffset + byteLength > fileBuffer.byteLength) {
+                        throw new Error('File is corrupt; attempting to read past buffer end.');
+                    }
+                    
+                    // Create a safe copy of the data slice
+                    const dataSlice = allChunks.slice(dataOffset, dataOffset + byteLength);
+                    const alignedBuffer = new Uint8Array(dataSlice);
+                    
+                    let flatData;
+                    if (tensorMeta.dtype === 'float32') {
+                        flatData = new Float32Array(alignedBuffer.buffer, alignedBuffer.byteOffset, numElements);
+                    } else {
+                        flatData = new Float64Array(alignedBuffer.buffer, alignedBuffer.byteOffset, numElements);
+                    }
+                    
+                    dataOffset += byteLength;
+                    
+                    // Handle reshaping based on dimensions
+                    if (tensorMeta.shape.length === 1) {
+                        // 1D tensor - no transpose needed
+                        return Array.from(flatData);
+                    } else if (tensorMeta.shape.length === 2) {
+                        // 2D tensor - read column-major as row-major
+                        // File shape is [rows, cols], data is stored column-major
+                        const [rows, cols] = tensorMeta.shape;
+                        const reshaped = [];
+                        
+                        for (let row = 0; row < rows; row++) {
+                            const rowData = new Array(cols);
+                            for (let col = 0; col < cols; col++) {
+                                // Column-major index: col * rows + row
+                                rowData[col] = flatData[col * rows + row];
+                            }
+                            reshaped.push(rowData);
+                        }
+                        return reshaped;
+                    } else {
+                        throw new Error(`Unsupported tensor dimension: ${tensorMeta.shape.length}`);
+                    }
+                };
+                
+                // Special reader for tokenEmbeddings: CUDA saves as [dim, vocabSize] column-major
+                // but JS expects [vocabSize, dim] row-major
+                const readTokenEmbeddingsTransposed = (tensorMeta) => {
+                    const numElements = tensorMeta.shape.reduce((acc, val) => acc * val, 1);
+                    let bytesPerElement;
+                    
+                    if (tensorMeta.dtype === 'float32') { bytesPerElement = 4; }
+                    else if (tensorMeta.dtype === 'float64') { bytesPerElement = 8; }
+                    else { throw new Error(`Unsupported dtype: ${tensorMeta.dtype}`); }
+                    
+                    const byteLength = numElements * bytesPerElement;
+                    if (dataOffset + byteLength > fileBuffer.byteLength) {
+                        throw new Error('File is corrupt; attempting to read past buffer end.');
+                    }
+                    
+                    // Create a safe copy of the data slice
+                    const dataSlice = allChunks.slice(dataOffset, dataOffset + byteLength);
+                    const alignedBuffer = new Uint8Array(dataSlice);
+                    
+                    let flatData;
+                    if (tensorMeta.dtype === 'float32') {
+                        flatData = new Float32Array(alignedBuffer.buffer, alignedBuffer.byteOffset, numElements);
+                    } else {
+                        flatData = new Float64Array(alignedBuffer.buffer, alignedBuffer.byteOffset, numElements);
+                    }
+                    
+                    dataOffset += byteLength;
+                    
+                    // File has shape [dim, vocabSize] stored column-major
+                    // JS expects [vocabSize, dim] row-major
+                    const [dim, vocabSize] = tensorMeta.shape;
+                    const reshaped = [];
+                    
+                    // Output shape: [vocabSize, dim]
+                    // For each vocab token (output row), collect all dim values
+                    for (let v = 0; v < vocabSize; v++) {
+                        const rowData = new Array(dim);
+                        for (let d = 0; d < dim; d++) {
+                            // In column-major [dim, vocabSize]: element at (d, v) is at index v * dim + d
+                            rowData[d] = flatData[v * dim + d];
+                        }
+                        reshaped.push(rowData);
+                    }
+                    
+                    console.log(`Token embeddings transposed: [${dim}, ${vocabSize}] -> [${vocabSize}, ${dim}]`);
+                    return reshaped;
+                };
+                
+                updateModelLoadingProgress(85, 'Reconstructing model (V2 format)...');
+                
+                // Reconstruct model - tokenEmbeddings needs special transpose handling
+                const tokenEmbeddings = readTokenEmbeddingsTransposed(metadata.tokenEmbeddings);
+                const finalRMSNormGamma = readTensorColumnMajorToRowMajor(metadata.finalRMSNormGamma);
+                
+                const transformerBlocks = metadata.transformerBlocks.map(blockMeta => {
+                    const loadedBlock = {};
+                    for (const tensorName in blockMeta) {
+                        loadedBlock[tensorName] = readTensorColumnMajorToRowMajor(blockMeta[tensorName]);
+                    }
+                    return loadedBlock;
+                });
+                
+                const modelData = {
+                    tokenEmbeddings,
+                    finalRMSNormGamma,
+                    transformerBlocks
+                };
+                
+                updateModelLoadingProgress(90, 'Loading model into memory...');
+                
+                // Assign to global variables
+                globalThis.tokenEmbeddings_GLOBAL = modelData.tokenEmbeddings;
+                globalThis.rmsGamma3_GLOBAL = modelData.finalRMSNormGamma;
+                globalThis.GLOBAL_WEIGHTS = modelData.transformerBlocks;
+                
+                updateModelLoadingProgress(100, 'Model loaded successfully!');
+                
+                console.log(`--- Successfully loaded weights (V2) from ${filename}. ---`);
+                console.log(`Token embeddings shape: [${modelData.tokenEmbeddings.length}, ${modelData.tokenEmbeddings[0]?.length || 0}]`);
+                console.log(`Transformer blocks: ${modelData.transformerBlocks.length}`);
+                
+                modelLoadingComplete = true;
+                
+                // Initialize LM network objects after model is loaded
+                globalThis.lmNetwork = new LmNetwork();
+                await lmNetwork.init();
+                lmNetwork.setupInference(SEQUENCE_LENGTH);
+                
+                console.log('✓ LM network objects initialized');
+                
+                // Hide indicator after a short delay
+                setTimeout(() => {
+                    $modelLoadingIndicator.addClass('loaded');
+                    setTimeout(() => {
+                        $modelLoadingIndicator.addClass('hidden');
+                    }, 500);
+                }, 1000);
+                
+                return true;
+                
+            } catch (error) {
+                console.error(`!!! Error loading model (V2) from '${filename}':`, error);
+                updateModelLoadingProgress(0, `Error: ${error.message}`);
+                
+                // Change styling to show error
+                $modelLoadingIndicator.css('border-color', '#ef4444');
+                $modelProgressFill.css('background', 'linear-gradient(135deg, #ef4444 0%, #dc2626 100%)');
+                
+                return false;
+            }
+        }
+        
+        // Load model weights from split binary files (V3 - for GitHub <100MB limit)
+        // File A: tokenEmbeddings, finalRMSNormGamma, transformer blocks 0 to (numTransformers/2 - 1)
+        // File B: transformer blocks (numTransformers/2) to (numTransformers - 1)
+        async function loadModelWeightsV3(filenameA, filenameB) {
+            console.log(`--- Attempting to load split binary model weights (V3) from ${filenameA} and ${filenameB}... ---`);
+            
+            // Show loading indicator
+            $modelLoadingIndicator.removeClass('hidden');
+            updateModelLoadingProgress(0, 'Fetching model files...');
+            
+            try {
+                // Helper to fetch and read a file with progress tracking
+                const fetchFileWithProgress = async (filename, progressStart, progressEnd) => {
+                    const response = await fetch(filename);
+                    
+                    if (!response.ok) {
+                        throw new Error(`Failed to fetch ${filename}: ${response.status} ${response.statusText}`);
+                    }
+                    
+                    const contentLength = response.headers.get('content-length');
+                    const total = contentLength ? parseInt(contentLength, 10) : 0;
+                    
+                    let received = 0;
+                    const reader = response.body.getReader();
+                    const chunks = [];
+                    
+                    while (true) {
+                        const { done, value } = await reader.read();
+                        if (done) break;
+                        
+                        chunks.push(value);
+                        received += value.length;
+                        
+                        if (total > 0) {
+                            const fileProgress = progressStart + (received / total) * (progressEnd - progressStart);
+                            updateModelLoadingProgress(fileProgress, `Downloading: ${(received / 1024 / 1024).toFixed(1)} MB`);
+                        }
+                    }
+                    
+                    const allChunks = new Uint8Array(received);
+                    let position = 0;
+                    for (const chunk of chunks) {
+                        allChunks.set(chunk, position);
+                        position += chunk.length;
+                    }
+                    
+                    return allChunks;
+                };
+                
+                // Fetch both files (A: 5-40%, B: 40-70%)
+                updateModelLoadingProgress(5, 'Downloading file A...');
+                const allChunksA = await fetchFileWithProgress(filenameA, 5, 40);
+                
+                updateModelLoadingProgress(40, 'Downloading file B...');
+                const allChunksB = await fetchFileWithProgress(filenameB, 40, 70);
+                
+                updateModelLoadingProgress(70, 'Parsing binary data...');
+                
+                // Helper to parse a file and create tensor readers
+                const parseFile = (allChunks) => {
+                    const fileBuffer = allChunks.buffer;
+                    const dataView = new DataView(fileBuffer);
+                    
+                    const headerLength = dataView.getBigUint64(0, true);
+                    const headerStart = 8;
+                    const headerEnd = headerStart + Number(headerLength);
+                    
+                    if (headerEnd > fileBuffer.byteLength) {
+                        throw new Error('Header length specified in file is larger than the file itself.');
+                    }
+                    
+                    const headerBuffer = allChunks.slice(headerStart, headerEnd);
+                    const metadata = JSON.parse(new TextDecoder('utf-8').decode(headerBuffer));
+                    
+                    const ALIGNMENT = 8;
+                    const paddingNeeded = (ALIGNMENT - (headerEnd % ALIGNMENT)) % ALIGNMENT;
+                    let dataOffset = headerEnd + paddingNeeded;
+                    
+                    return { allChunks, fileBuffer, metadata, dataOffset };
+                };
+                
+                // Parse both files
+                const fileA = parseFile(allChunksA);
+                const fileB = parseFile(allChunksB);
+                
+                updateModelLoadingProgress(75, 'Processing tensors (V3 format)...');
+                
+                // Create tensor reader for a specific file context
+                const createTensorReader = (fileCtx) => {
+                    let dataOffset = fileCtx.dataOffset;
+                    
+                    const readTensorColumnMajorToRowMajor = (tensorMeta) => {
+                        const numElements = tensorMeta.shape.reduce((acc, val) => acc * val, 1);
+                        let bytesPerElement;
+                        
+                        if (tensorMeta.dtype === 'float32') { bytesPerElement = 4; }
+                        else if (tensorMeta.dtype === 'float64') { bytesPerElement = 8; }
+                        else { throw new Error(`Unsupported dtype: ${tensorMeta.dtype}`); }
+                        
+                        const byteLength = numElements * bytesPerElement;
+                        if (dataOffset + byteLength > fileCtx.fileBuffer.byteLength) {
+                            throw new Error('File is corrupt; attempting to read past buffer end.');
+                        }
+                        
+                        const dataSlice = fileCtx.allChunks.slice(dataOffset, dataOffset + byteLength);
+                        const alignedBuffer = new Uint8Array(dataSlice);
+                        
+                        let flatData;
+                        if (tensorMeta.dtype === 'float32') {
+                            flatData = new Float32Array(alignedBuffer.buffer, alignedBuffer.byteOffset, numElements);
+                        } else {
+                            flatData = new Float64Array(alignedBuffer.buffer, alignedBuffer.byteOffset, numElements);
+                        }
+                        
+                        dataOffset += byteLength;
+                        
+                        if (tensorMeta.shape.length === 1) {
+                            return Array.from(flatData);
+                        } else if (tensorMeta.shape.length === 2) {
+                            const [rows, cols] = tensorMeta.shape;
+                            const reshaped = [];
+                            
+                            for (let row = 0; row < rows; row++) {
+                                const rowData = new Array(cols);
+                                for (let col = 0; col < cols; col++) {
+                                    rowData[col] = flatData[col * rows + row];
+                                }
+                                reshaped.push(rowData);
+                            }
+                            return reshaped;
+                        } else {
+                            throw new Error(`Unsupported tensor dimension: ${tensorMeta.shape.length}`);
+                        }
+                    };
+                    
+                    const readTokenEmbeddingsTransposed = (tensorMeta) => {
+                        const numElements = tensorMeta.shape.reduce((acc, val) => acc * val, 1);
+                        let bytesPerElement;
+                        
+                        if (tensorMeta.dtype === 'float32') { bytesPerElement = 4; }
+                        else if (tensorMeta.dtype === 'float64') { bytesPerElement = 8; }
+                        else { throw new Error(`Unsupported dtype: ${tensorMeta.dtype}`); }
+                        
+                        const byteLength = numElements * bytesPerElement;
+                        if (dataOffset + byteLength > fileCtx.fileBuffer.byteLength) {
+                            throw new Error('File is corrupt; attempting to read past buffer end.');
+                        }
+                        
+                        const dataSlice = fileCtx.allChunks.slice(dataOffset, dataOffset + byteLength);
+                        const alignedBuffer = new Uint8Array(dataSlice);
+                        
+                        let flatData;
+                        if (tensorMeta.dtype === 'float32') {
+                            flatData = new Float32Array(alignedBuffer.buffer, alignedBuffer.byteOffset, numElements);
+                        } else {
+                            flatData = new Float64Array(alignedBuffer.buffer, alignedBuffer.byteOffset, numElements);
+                        }
+                        
+                        dataOffset += byteLength;
+                        
+                        const [dim, vocabSize] = tensorMeta.shape;
+                        const reshaped = [];
+                        
+                        for (let v = 0; v < vocabSize; v++) {
+                            const rowData = new Array(dim);
+                            for (let d = 0; d < dim; d++) {
+                                rowData[d] = flatData[v * dim + d];
+                            }
+                            reshaped.push(rowData);
+                        }
+                        
+                        console.log(`Token embeddings transposed: [${dim}, ${vocabSize}] -> [${vocabSize}, ${dim}]`);
+                        return reshaped;
+                    };
+                    
+                    return { readTensorColumnMajorToRowMajor, readTokenEmbeddingsTransposed };
+                };
+                
+                updateModelLoadingProgress(80, 'Loading file A (embeddings + transformers 1-4)...');
+                
+                // Read from file A
+                const readerA = createTensorReader(fileA);
+                const tokenEmbeddings = readerA.readTokenEmbeddingsTransposed(fileA.metadata.tokenEmbeddings);
+                const finalRMSNormGamma = readerA.readTensorColumnMajorToRowMajor(fileA.metadata.finalRMSNormGamma);
+                
+                const transformerBlocksA = fileA.metadata.transformerBlocks.map(blockMeta => {
+                    const loadedBlock = {};
+                    for (const tensorName in blockMeta) {
+                        loadedBlock[tensorName] = readerA.readTensorColumnMajorToRowMajor(blockMeta[tensorName]);
+                    }
+                    return loadedBlock;
+                });
+                
+                updateModelLoadingProgress(85, 'Loading file B (transformers 5-8)...');
+                
+                // Read from file B
+                const readerB = createTensorReader(fileB);
+                const transformerBlocksB = fileB.metadata.transformerBlocks.map(blockMeta => {
+                    const loadedBlock = {};
+                    for (const tensorName in blockMeta) {
+                        loadedBlock[tensorName] = readerB.readTensorColumnMajorToRowMajor(blockMeta[tensorName]);
+                    }
+                    return loadedBlock;
+                });
+                
+                // Combine transformer blocks
+                const transformerBlocks = [...transformerBlocksA, ...transformerBlocksB];
+                
+                const modelData = {
+                    tokenEmbeddings,
+                    finalRMSNormGamma,
+                    transformerBlocks
+                };
+                
+                updateModelLoadingProgress(90, 'Loading model into memory...');
+                
+                // Assign to global variables
+                globalThis.tokenEmbeddings_GLOBAL = modelData.tokenEmbeddings;
+                globalThis.rmsGamma3_GLOBAL = modelData.finalRMSNormGamma;
+                globalThis.GLOBAL_WEIGHTS = modelData.transformerBlocks;
+                
+                updateModelLoadingProgress(100, 'Model loaded successfully!');
+                
+                console.log(`--- Successfully loaded weights (V3 split) from ${filenameA} and ${filenameB}. ---`);
+                console.log(`Token embeddings shape: [${modelData.tokenEmbeddings.length}, ${modelData.tokenEmbeddings[0]?.length || 0}]`);
+                console.log(`Transformer blocks from A: ${transformerBlocksA.length}, from B: ${transformerBlocksB.length}`);
+                console.log(`Total transformer blocks: ${modelData.transformerBlocks.length}`);
+                
+                modelLoadingComplete = true;
+                
+                // Initialize LM network objects after model is loaded
+                globalThis.lmNetwork = new LmNetwork();
+                await lmNetwork.init();
+                lmNetwork.setupInference(SEQUENCE_LENGTH);
+                
+                console.log('✓ LM network objects initialized');
+                
+                // Hide indicator after a short delay
+                setTimeout(() => {
+                    $modelLoadingIndicator.addClass('loaded');
+                    setTimeout(() => {
+                        $modelLoadingIndicator.addClass('hidden');
+                    }, 500);
+                }, 1000);
+                
+                return true;
+                
+            } catch (error) {
+                console.error(`!!! Error loading model (V3) from '${filenameA}' and '${filenameB}':`, error);
                 updateModelLoadingProgress(0, `Error: ${error.message}`);
                 
                 // Change styling to show error
@@ -2615,7 +3118,14 @@
                 $('#model-selector-modal').removeClass('hidden').css('display', 'flex');
             } else {
                 // Load default model weights asynchronously (don't await - let it load in background)
-                loadModelWeights('./model/model_15_lr_3e6.bin').then(success => {
+                /*loadModelWeightsV2('./model/weights_iter_600000.bin').then(success => {
+                    if (success) {
+                        console.log('✓ Model weights ready');
+                    } else {
+                        console.error('✗ Failed to load model weights');
+                    }
+                });*/
+                loadModelWeightsV3('./model/weights_iter_600000_A.bin', './model/weights_iter_600000_B.bin').then(success => {
                     if (success) {
                         console.log('✓ Model weights ready');
                     } else {
@@ -2642,7 +3152,7 @@
             $('#model-selector-modal').addClass('hidden').css('display', 'none');
             
             // Load the selected model
-            loadModelWeights(`./model/${modelFile}`).then(success => {
+            loadModelWeightsV2(modelFile).then(success => {
                 if (success) {
                     console.log(`✓ Model ${modelFile} loaded successfully`);
                 } else {
