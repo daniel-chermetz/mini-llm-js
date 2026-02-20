@@ -1,0 +1,71 @@
+const fs = require('fs');
+const path = require('path');
+const { execSync } = require('child_process');
+
+const DIR_NAME = 'tokenizedVictorianStories';
+const DIR_PATH = path.join(__dirname, DIR_NAME);
+const BATCH_SIZE = 50;
+
+function runCommand(command) {
+    try {
+        // stdio: 'inherit' prints the git output directly to your terminal
+        execSync(command, { stdio: 'inherit' });
+        return true;
+    } catch (error) {
+        return false; // Command failed (e.g., nothing to commit)
+    }
+}
+
+function main() {
+    // 1. Get all JSON files and sort them
+    const files = fs.readdirSync(DIR_PATH)
+        .filter(file => file.endsWith('.json'))
+        .sort();
+
+    if (files.length === 0) {
+        console.log('No JSON files found to push.');
+        return;
+    }
+
+    // 2. Process files in chunks of 50
+    for (let i = 0; i < files.length; i += BATCH_SIZE) {
+        const batchNumber = Math.floor(i / BATCH_SIZE) + 1;
+        const totalBatches = Math.ceil(files.length / BATCH_SIZE);
+        
+        console.log(`\n==================================================`);
+        console.log(`🚀 Processing Batch ${batchNumber} of ${totalBatches}`);
+        console.log(`==================================================`);
+
+        // Grab the next 50 files
+        const batchFiles = files.slice(i, i + BATCH_SIZE);
+        
+        // Create an array of relative paths (e.g., "tokenizedVictorianStories/file_0001.json")
+        // Wrapped in quotes just in case there are unexpected spaces
+        const filePaths = batchFiles.map(f => `"${DIR_NAME}/${f}"`).join(' ');
+
+        // 3. Git Add
+        console.log('-> Staging files...');
+        runCommand(`git add ${filePaths}`);
+
+        // 4. Git Commit
+        console.log('-> Committing...');
+        // We use a custom commit message so you know which batch is which
+        const commitSuccess = runCommand(`git commit -m "Add ${DIR_NAME} batch ${batchNumber}"`);
+
+        // 5. Git Push (only if the commit was successful)
+        if (commitSuccess) {
+            console.log('-> Pushing to GitHub...');
+            const pushSuccess = runCommand('git push');
+            if (!pushSuccess) {
+                console.error(`❌ Push failed on batch ${batchNumber}. Stopping script so you can check your connection.`);
+                process.exit(1);
+            }
+        } else {
+            console.log('-> No changes to commit in this batch (files likely already pushed). Skipping push.');
+        }
+    }
+
+    console.log('\n🎉 All batches processed successfully!');
+}
+
+main();
