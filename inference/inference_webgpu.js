@@ -3,32 +3,27 @@ globalThis.Transformer = function(tIndex, L_param) {
 	const headDim = dimensions / NetworkMeta.heads;
 	let L = L_param;
 
-	this.setInputs = (inputs, L_param) => {
-		L = L_param;
-		this.inputs = lmNetwork.setInputs_WEBGPU(inputs, L);
-	}
-
-	this.RMSNorm = (xInputs, rmsGamma) => {
-		const xInputsPostRMSGamma = lmNetwork.RMSNorm_WEBGPU(xInputs, rmsGamma, L);
+	this.RMSNorm = (xInputs, rmsGamma, rmsOutputBuffer) => {
+		const xInputsPostRMSGamma = lmNetwork.RMSNorm_WEBGPU(xInputs, rmsGamma, rmsOutputBuffer);
 		return xInputsPostRMSGamma;
 	}
 
 	this.generateVals = () => {
-		this.vals = lmNetwork.matMul_dim_L_dim_dim_WEBGPU(this.valueWeights, this.inputsPostRMS, L);
+		this.vals = lmNetwork.matMul_dim_L_dim_dim_WEBGPU(this.valueWeights, this.inputsPostRMS, lmNetwork.preBuffers.matMulV);
 		this.valsByHead = this.vals;
 	}
 
 	this.generateKeys = () => {
-		this.keys = lmNetwork.matMul_dim_L_dim_dim_WEBGPU(this.keyWeights, this.inputsPostRMS, L);
+		this.keys = lmNetwork.matMul_dim_L_dim_dim_WEBGPU(this.keyWeights, this.inputsPostRMS, lmNetwork.preBuffers.matMulK);
 		this.keysByHead = this.keys;
 	}
 
 	this.generateQueries = () => {
-		this.queries = lmNetwork.matMul_dim_L_dim_dim_WEBGPU(this.queryWeights, this.inputsPostRMS, L);
+		this.queries = lmNetwork.matMul_dim_L_dim_dim_WEBGPU(this.queryWeights, this.inputsPostRMS, lmNetwork.preBuffers.matMulQ);
 		this.queriesByHead = this.queries;
 	}
 
-	this.applyRoPE = (keysOrQueriesByHead) => {
+	this.applyRoPE = (keysOrQueriesByHead, ropeOutputBuffer) => {
 		if (!lmNetwork.precomputedTheta) {
 			const flatPrecomputedTheta = new Float32Array(headDim * L);
 
@@ -40,38 +35,31 @@ globalThis.Transformer = function(tIndex, L_param) {
 				}
 			}
 			
-			lmNetwork.precomputedTheta = executeLoadPrecomputedTheta(lmNetwork, flatPrecomputedTheta, headPairs * L, 2);
+			lmNetwork.precomputedTheta = globalThis.executeLoadPrecomputedTheta(lmNetwork, flatPrecomputedTheta, headPairs * L, 2);
 		}
 
-		const keysOrQueriesByHeadPostRoPE = lmNetwork.RoPE_WEBGPU(keysOrQueriesByHead, lmNetwork.precomputedTheta);
+		const keysOrQueriesByHeadPostRoPE = lmNetwork.RoPE_WEBGPU(keysOrQueriesByHead, lmNetwork.precomputedTheta, ropeOutputBuffer);
 		return keysOrQueriesByHeadPostRoPE;
 	}
 
 	this.getAttentionScoresByHead = () => {	
-		const attentionByHeadPreSoftmax = lmNetwork.matMul_KtQ_WEBGPU(this.keysByHeadPostRoPE, this.queriesByHeadPostRoPE);
-		const attentionByHeadPreSoftmaxScaledMasked = lmNetwork.scaleAndMaskAttention_WEBGPU(attentionByHeadPreSoftmax);
-		this.attentionByHeadPostSoftmax = lmNetwork.softmaxByHead_WEBGPU(attentionByHeadPreSoftmaxScaledMasked);
-		this.valueScaledAttentionByHead = lmNetwork.matMulValsAttention_WEBGPU(this.valsByHead, this.attentionByHeadPostSoftmax);
-	}
-
-	this.concatAttentionScoreHeads = () => {
-		this.concatAllHeadAttentionScores = lmNetwork.concatHeads_WEBGPU(this.valueScaledAttentionByHead);
+		const attentionByHeadPreSoftmaxScaledMasked = lmNetwork.matMul_KtQ_WEBGPU();
+		this.attentionByHeadPostSoftmax = lmNetwork.softmaxByHead_WEBGPU();
+		this.valueScaledAttentionByHead = lmNetwork.matMulValsAttention_WEBGPU();
 	}
 
 	this.projectConcatAttentionToOutput = () => {
-		this.outputProjectedAttention = lmNetwork.matMul_dim_L_dim_dim_WEBGPU(this.outputProjectionWeights, this.concatAllHeadAttentionScores);
+		this.outputProjectedAttention = lmNetwork.matMul_dim_L_dim_dim_WEBGPU(this.outputProjectionWeights, this.valueScaledAttentionByHead, lmNetwork.preBuffers.outputProj);
 	}
 
 	this.addResidualInputsToConcatAttentionOutput = () => {
-		this.outputProjectedAttentionScoresPlusResidualInputs = lmNetwork.elementWiseAdd_WEBGPU(this.outputProjectedAttention, this.inputs);
+		this.outputProjectedAttentionScoresPlusResidualInputs = lmNetwork.elementWiseAdd_WEBGPU(this.outputProjectedAttention, this.inputs, lmNetwork.preBuffers.residual1);
 	}
 
 	this.applyFeedforwardToAttention = () => {
-		const ffnDim = dimensions * NetworkMeta.ffnDimMultiplier;
-
-		const left1MatrixPreSilu = lmNetwork.matMul_FFN1_WEBGPU(this.feedForwardWeights1A, this.outputProjectedAttentionScoresPostRMS2);
+		const left1MatrixPreSilu = lmNetwork.matMul_FFN1_WEBGPU(this.feedForwardWeights1A, this.outputProjectedAttentionScoresPostRMS2, lmNetwork.preBuffers.ffn1a);
 		const left1Matrix = lmNetwork.applySilu_WEBGPU(left1MatrixPreSilu);
-		const right1Matrix = lmNetwork.matMul_FFN1_WEBGPU(this.feedForwardWeights1B, this.outputProjectedAttentionScoresPostRMS2);
+		const right1Matrix = lmNetwork.matMul_FFN1_WEBGPU(this.feedForwardWeights1B, this.outputProjectedAttentionScoresPostRMS2, lmNetwork.preBuffers.ffn1b);
 
 		const final1Matrix = lmNetwork.applyHadamard_WEBGPU(left1Matrix, right1Matrix);
 		
@@ -79,26 +67,25 @@ globalThis.Transformer = function(tIndex, L_param) {
 	}
 
 	this.getFinalTransformerOutputByAddingResidualToFFNResult = () => {
-		this.finalTransformerOutput = lmNetwork.elementWiseAdd_WEBGPU(this.attentionPostFeedForward, this.outputProjectedAttentionScoresPlusResidualInputs);
+		this.finalTransformerOutput = lmNetwork.elementWiseAdd_WEBGPU(this.attentionPostFeedForward, this.outputProjectedAttentionScoresPlusResidualInputs, lmNetwork.preBuffers.residual2);
 	}
 
 	this.applyTransformChainToInputs = (downstreamInputs) => {
 		this.inputs = downstreamInputs;
-		this.inputsPostRMS = this.RMSNorm(this.inputs, this.rmsGamma, 'rms1');
+		this.inputsPostRMS = this.RMSNorm(this.inputs, this.rmsGamma, lmNetwork.preBuffers.rms1);
 
 		this.generateVals();
 		this.generateKeys();
 		this.generateQueries();
 
-		this.keysByHeadPostRoPE = this.applyRoPE(this.keysByHead);
-		this.queriesByHeadPostRoPE = this.applyRoPE(this.queriesByHead);
+		this.keysByHeadPostRoPE = this.applyRoPE(this.keysByHead, lmNetwork.preBuffers.ropeK);
+		this.queriesByHeadPostRoPE = this.applyRoPE(this.queriesByHead, lmNetwork.preBuffers.ropeQ);
 
 		this.getAttentionScoresByHead();
-		this.concatAttentionScoreHeads();
 		this.projectConcatAttentionToOutput();
 		this.addResidualInputsToConcatAttentionOutput();
 
-		this.outputProjectedAttentionScoresPostRMS2 = this.RMSNorm(this.outputProjectedAttentionScoresPlusResidualInputs, this.rmsGamma2, 'rms2');
+		this.outputProjectedAttentionScoresPostRMS2 = this.RMSNorm(this.outputProjectedAttentionScoresPlusResidualInputs, this.rmsGamma2, lmNetwork.preBuffers.rms2);
 		
 		this.applyFeedforwardToAttention();
 		this.getFinalTransformerOutputByAddingResidualToFFNResult();
@@ -274,7 +261,8 @@ globalThis.LmNetwork = function () {
 			const shaderCode = `
 				@group(0) @binding(0) var<storage, read> indices: array<u32>;
 				@group(0) @binding(1) var<storage, read> tokenEmbeddings: array<f32>;
-				@group(0) @binding(2) var<storage, read_write> output: array<f32>;
+				@group(0) @binding(2) var<storage, read> rightEndIndexArr: array<u32>;
+				@group(0) @binding(3) var<storage, read_write> output: array<f32>;
 				
 				@compute @workgroup_size(8, 8)
 				fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
@@ -282,14 +270,14 @@ globalThis.LmNetwork = function () {
 					let row = global_id.y; // dimensions
 					let dimensions = ${dimensions}u;
 					let L = ${L}u;
-					
-					if (col < L && row < dimensions) {
+					let activeL = rightEndIndexArr[0] + 1u;
+
+					if (col < activeL && row < dimensions) {
 						let tokenIndex = indices[col];
 						let embeddingIndex = tokenIndex * dimensions + row;
-						let outputIndex = row * L + col;
-						output[outputIndex] = tokenEmbeddings[embeddingIndex];
+						let outputIndex = row * L + col;				
+						output[outputIndex] = tokenEmbeddings[embeddingIndex];					}
 					}
-				}
 			`;
 
 			this.setInputTokenEmbeddings_WEBGPU = function(inputTokenEmbeddingIndices, tokenEmbeddings) {			
@@ -298,35 +286,12 @@ globalThis.LmNetwork = function () {
 			};
 		}
 
-		if (!this.setInputs_WEBGPU) {
-			const shaderCode = `
-				@group(0) @binding(0) var<storage, read> inputs: array<f32>;
-				@group(0) @binding(1) var<storage, read_write> output: array<f32>;
-				
-				@compute @workgroup_size(8, 8)
-				fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
-					let col = global_id.x;
-					let row = global_id.y;
-					let dimensions = ${dimensions}u;
-					let L = ${L}u;
-					
-					if (col < L && row < dimensions) {
-						let index = row * L + col;
-						output[index] = inputs[index];
-					}
-				}
-			`;
-
-			this.setInputs_WEBGPU = function(xInputsBuffer) {
-				return executeSetInputs(this, xInputsBuffer.buffer, dimensions, L, shaderCode);
-			};
-		}
-
 		if (!this.RMSNorm_WEBGPU) {
 			const shaderCode = `
 				@group(0) @binding(0) var<storage, read> xInputs: array<f32>;
 				@group(0) @binding(1) var<storage, read> rmsGamma: array<f32>;
-				@group(0) @binding(2) var<storage, read_write> output: array<f32>;
+				@group(0) @binding(2) var<storage, read> rightEndIndexArr: array<u32>;				
+				@group(0) @binding(3) var<storage, read_write> output: array<f32>;
 				
 				@compute @workgroup_size(8, 8)
 				fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
@@ -334,8 +299,9 @@ globalThis.LmNetwork = function () {
 					let row = global_id.y;
 					let dimensions = ${dimensions}u;
 					let L = ${L}u;
+					let activeL = rightEndIndexArr[0] + 1u;
 					
-					if (col < L && row < dimensions) {
+					if (col < activeL && row < dimensions) {
 						var colSquareSum: f32 = 0.0;
 						for (var rowIndex: u32 = 0u; rowIndex < dimensions; rowIndex = rowIndex + 1u) {
 							let index = rowIndex * L + col;
@@ -352,8 +318,8 @@ globalThis.LmNetwork = function () {
 				}
 			`;
 
-			this.RMSNorm_WEBGPU = function(xInputs, rmsGamma) {
-				return executeRMSNorm(this, xInputs.buffer, rmsGamma.buffer, dimensions, L, shaderCode);
+			this.RMSNorm_WEBGPU = function(xInputs, rmsGamma, rmsOutputBuffer) {
+				return executeRMSNorm(this, xInputs.buffer, rmsGamma.buffer, dimensions, L, shaderCode, rmsOutputBuffer);
 			};
 		}
 
@@ -361,7 +327,8 @@ globalThis.LmNetwork = function () {
 			const shaderCode = `
 				@group(0) @binding(0) var<storage, read> a: array<f32>;
 				@group(0) @binding(1) var<storage, read> b: array<f32>;
-				@group(0) @binding(2) var<storage, read_write> output: array<f32>;
+				@group(0) @binding(2) var<storage, read> rightEndIndexArr: array<u32>;				
+				@group(0) @binding(3) var<storage, read_write> output: array<f32>;
 				
 				@compute @workgroup_size(8, 8)
 				fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
@@ -369,8 +336,9 @@ globalThis.LmNetwork = function () {
 					let row = global_id.y; // dimensions
 					let dimensions = ${dimensions}u;
 					let L = ${L}u;
+					let activeL = rightEndIndexArr[0] + 1u;
 					
-					if (col < L && row < dimensions) {
+					if (col < activeL && row < dimensions) {
 						var sum: f32 = 0.0;
 						for (var i: u32 = 0u; i < dimensions; i = i + 1u) {
 							let aIndex = row * dimensions + i;
@@ -383,37 +351,8 @@ globalThis.LmNetwork = function () {
 				}
 			`;
 
-			this.matMul_dim_L_dim_dim_WEBGPU = function(a, b) {
-				return executeMatMul_dim_L_dim_dim(this, a.buffer, b.buffer, dimensions, L, shaderCode);
-			};
-		}
-
-		if (!this.splitVKQByHead_WEBGPU) {
-			const shaderCode = `
-				@group(0) @binding(0) var<storage, read> fullKQV: array<f32>;
-				@group(0) @binding(1) var<storage, read_write> output: array<f32>;
-				
-				@compute @workgroup_size(8, 8, 1)
-				fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
-					let col = global_id.x; // L
-					let row = global_id.y; // headDim
-					let head = global_id.z; // head index
-					let headDim = ${headDim}u;
-					let L = ${L}u;
-					let heads = ${heads}u;
-					
-					if (col < L && row < headDim && head < heads) {
-						let inputRow = head * headDim + row;
-						let inputIndex = inputRow * L + col;
-						let headOffset = head * headDim * L;
-						let outputIndex = headOffset + row * L + col;
-						output[outputIndex] = fullKQV[inputIndex];
-					}
-				}
-			`;
-
-			this.splitVKQByHead_WEBGPU = function(fullKQV) {
-				return executeSplitVKQByHead(this, fullKQV.buffer, headDim, heads, L, shaderCode);
+			this.matMul_dim_L_dim_dim_WEBGPU = function(a, b, outputBuffer) {
+				return executeMatMul_dim_L_dim_dim(this, a.buffer, b.buffer, dimensions, L, shaderCode, outputBuffer);
 			};
 		}
 	 
@@ -423,7 +362,8 @@ globalThis.LmNetwork = function () {
 			const shaderCode = `
 				@group(0) @binding(0) var<storage, read> input: array<f32>;
 				@group(0) @binding(1) var<storage, read> theta: array<f32>;
-				@group(0) @binding(2) var<storage, read_write> output: array<f32>;
+				@group(0) @binding(2) var<storage, read> rightEndIndexArr: array<u32>;				
+				@group(0) @binding(3) var<storage, read_write> output: array<f32>;
 				
 				@compute @workgroup_size(8, 8, 1)
 				fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
@@ -432,11 +372,12 @@ globalThis.LmNetwork = function () {
 					let head = global_id.z; // head index
 					
 					let L = ${L}u;
+					let activeL = rightEndIndexArr[0] + 1u;
 					let headDim = ${headDim}u;
 					let heads = ${heads}u;
 					let headPairs = ${headPairs}u;
 					
-					if (col >= L || row >= headDim || head >= heads) {
+					if (col >= activeL || row >= headDim || head >= heads) {
 						return;
 					}
 					
@@ -466,16 +407,19 @@ globalThis.LmNetwork = function () {
 				}
 			`;
 
-			this.RoPE_WEBGPU = function(keysOrQueriesByHead, precomputedTheta) {
-				return executeRoPE(this, keysOrQueriesByHead.buffer, precomputedTheta.buffer, headDim, heads, L, shaderCode);
+			this.RoPE_WEBGPU = function(keysOrQueriesByHead, precomputedTheta, ropeOutputBuffer) {
+				return executeRoPE(this, keysOrQueriesByHead.buffer, precomputedTheta.buffer, headDim, heads, L, shaderCode, ropeOutputBuffer);
 			};
 		}
 
 		if (!this.matMul_KtQ_WEBGPU) {
+			const sqrtHeadDim = Math.sqrt(headDim);
+
 			const shaderCode = `
 				@group(0) @binding(0) var<storage, read> keys: array<f32>;
 				@group(0) @binding(1) var<storage, read> queries: array<f32>;
-				@group(0) @binding(2) var<storage, read_write> output: array<f32>;
+				@group(0) @binding(2) var<storage, read> rightEndIndexArr: array<u32>;				
+				@group(0) @binding(3) var<storage, read_write> output: array<f32>;
 				
 				@compute @workgroup_size(8, 8, 1)
 				fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
@@ -484,12 +428,21 @@ globalThis.LmNetwork = function () {
 					let head = global_id.z; // head index
 					
 					let L = ${L}u;
+					let activeL = rightEndIndexArr[0] + 1u;				
 					let headDim = ${headDim}u;
+					let sqrtHeadDim = ${sqrtHeadDim}f;
 					let heads = ${heads}u;
 					let inputHeadOffset = head * headDim * L;
 
-					if (outCol >= L || outRow >= L || head >= heads) {
+					if (outCol >= activeL || outRow >= L || head >= heads) {
 						return;
+					}
+
+					let outputHeadOffset = head * L * L;
+					let outputIndex = outputHeadOffset + outRow * L + outCol;
+
+					if (outRow > outCol) {
+						output[outputIndex] = 0.0f;
 					}
 					
 					var sum: f32 = 0.0;
@@ -498,67 +451,26 @@ globalThis.LmNetwork = function () {
 						let qIndex = inputHeadOffset + i * L + outCol; // also over column on the right matrix (as always)
 						sum = sum + keys[kIndex] * queries[qIndex];
 					}
-					
-					let outputHeadOffset = head * L * L;
-					let outputIndex = outputHeadOffset + outRow * L + outCol;
-					output[outputIndex] = sum;
+					output[outputIndex] = sum / sqrtHeadDim;
 				}
 			`;
 
-			this.matMul_KtQ_WEBGPU = function(keys, queries) {
-				return executeKtQ(this, keys.buffer, queries.buffer, headDim, heads, L, shaderCode);
-			};
-		}
-
-		if (!this.scaleAndMaskAttention_WEBGPU) {
-			const sqrtHeadDim = Math.sqrt(headDim);
-
-			const shaderCode = `
-				@group(0) @binding(0) var<storage, read> input: array<f32>;
-				@group(0) @binding(1) var<storage, read_write> output: array<f32>;
-
-				@compute @workgroup_size(8, 8, 1)
-				fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
-					let col = global_id.x; // column L
-					let row = global_id.y; // row L
-					let head = global_id.z; // head index
-					
-					let L = ${L}u;
-					let heads = ${heads}u;
-					let sqrtHeadDim = ${sqrtHeadDim}f;
-					
-					if (col >= L || row >= L || head >= heads) {
-						return;
-					}
-					
-					let headOffset = head * L * L;
-					let index = headOffset + row * L + col;
-					
-					// causal mask: if row > col, set to -Infinity
-					if (row > col) {
-						// a very large negative number
-						output[index] = -3.402823e+38f;
-					} else {
-						output[index] = input[index] / sqrtHeadDim;
-					}
-				}
-			`;
-
-			this.scaleAndMaskAttention_WEBGPU = function(attentionScores) {
-				return executeScaleAndMask(this, attentionScores.buffer, heads, L, shaderCode);
+			this.matMul_KtQ_WEBGPU = function() {
+				return executeKtQ(this, heads, shaderCode);
 			};
 		}
 
 		if (!this.softmaxByHead_WEBGPU) {
 			const colMaxShader = `
 			@group(0) @binding(0) var<storage, read> attnScores: array<f32>;
-			@group(0) @binding(1) var<storage, read_write> maxByCol: array<f32>;
+			@group(0) @binding(1) var<storage, read> rightEndIndexArr: array<u32>;
+			@group(0) @binding(2) var<storage, read_write> maxByCol: array<f32>;
 			@compute @workgroup_size(32)
 			fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
-				const L = ${L}u;
-				const heads = ${heads}u;
-
 				let globalCol = global_id.x; // L
+				let L = ${L}u;
+				let activeL = rightEndIndexArr[0] + 1u;
+				let heads = ${heads}u;
 
 				if (globalCol >= L * heads) {
 					return;
@@ -566,6 +478,10 @@ globalThis.LmNetwork = function () {
 
 				let headIndex = globalCol / L; // u type drops decimal automatically
 				let colWithinHeadIndex = globalCol - headIndex * L;
+
+				if (colWithinHeadIndex >= activeL) {
+					return;
+				}
 
 				let attnColIndex = headIndex * L * L + colWithinHeadIndex;
 				var max: f32 = -3.402823e+38f;
@@ -574,7 +490,6 @@ globalThis.LmNetwork = function () {
 						max = attnScores[attnColIndex + i * L];
 					}
 				}
-
 				maxByCol[globalCol] = max;
 			}
 			`
@@ -582,13 +497,14 @@ globalThis.LmNetwork = function () {
 			const colSumShader = `
 			@group(0) @binding(0) var<storage, read> attnScores: array<f32>;
 			@group(0) @binding(1) var<storage, read> maxByCol: array<f32>;
-			@group(0) @binding(2) var<storage, read_write> sumByCol: array<f32>;
+			@group(0) @binding(2) var<storage, read> rightEndIndexArr: array<u32>;				
+			@group(0) @binding(3) var<storage, read_write> sumByCol: array<f32>;
 			@compute @workgroup_size(32)
 			fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
-				const L = ${L}u;
-				const heads = ${heads}u;
-
 				let globalCol = global_id.x; // L
+				let L = ${L}u;
+				let activeL = rightEndIndexArr[0] + 1u;				
+				let heads = ${heads}u;
 
 				if (globalCol >= L * heads) {
 					return;
@@ -597,13 +513,16 @@ globalThis.LmNetwork = function () {
 				let headIndex = globalCol / L; // u type drops decimal automatically
 				let colWithinHeadIndex = globalCol - headIndex * L;
 
+				if (colWithinHeadIndex >= activeL) {
+					return;
+				}
+
 				let attnColIndex = headIndex * L * L + colWithinHeadIndex;
 				let colMax = maxByCol[globalCol];
 				var sum: f32 = 0f;
 				for (var i: u32 = 0u; i <= colWithinHeadIndex; i = i + 1u) {
 					sum += exp(attnScores[attnColIndex + i * L] - colMax);
 				}
-
 				sumByCol[globalCol] = sum;
 			}
 			`
@@ -612,17 +531,19 @@ globalThis.LmNetwork = function () {
 			@group(0) @binding(0) var<storage, read> attnScores: array<f32>;
 			@group(0) @binding(1) var<storage, read> maxByCol: array<f32>;
 			@group(0) @binding(2) var<storage, read> sumByCol: array<f32>;
-			@group(0) @binding(3) var<storage, read_write> softmaxAttnScores: array<f32>;
+			@group(0) @binding(3) var<storage, read> rightEndIndexArr: array<u32>;				
+			@group(0) @binding(4) var<storage, read_write> softmaxAttnScores: array<f32>;
 			@compute @workgroup_size(8, 8, 1)
 			fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
-				const L = ${L}u;
-				const heads = ${heads}u;
-
 				let headCol = global_id.x; // L
 				let headRow = global_id.y; // L
 				let headIndex = global_id.z;
+				
+				let L = ${L}u;
+				let activeL = rightEndIndexArr[0] + 1u;				
+				let heads = ${heads}u;
 
-				if (headCol >= L || headRow >= L || headIndex >= heads) {
+				if (headCol >= activeL || headRow >= L || headIndex >= heads) {
 					return;
 				}
 
@@ -631,19 +552,19 @@ globalThis.LmNetwork = function () {
 
 				// masking
 				if (headRow > headCol) {
-					softmaxAttnScores[attnScoreIndex] = 0.0;
+					softmaxAttnScores[attnScoreIndex] = 0.0f;
 					return;
 				}
 
 				let expSumOfCol = sumByCol[globalColIndex];
 				softmaxAttnScores[attnScoreIndex] = exp(attnScores[attnScoreIndex] - maxByCol[globalColIndex]) / expSumOfCol;
-			}			
+			}
 			`
 
-			this.softmaxByHead_WEBGPU = function(attentionScores) {
-				const colMax = executeColMax(this, attentionScores.buffer, heads, L, colMaxShader);
-				const colSum = executeColSum(this, attentionScores.buffer, colMax.buffer, heads, L, colSumShader);
-				return executeSoftmaxByHead(this, attentionScores.buffer, colMax.buffer, colSum.buffer, heads, L, colSoftmaxShader);
+			this.softmaxByHead_WEBGPU = function() {
+				const colMax = executeColMax(this, heads, L, colMaxShader);
+				const colSum = executeColSum(this, heads, L, colSumShader);
+				return executeSoftmaxByHead(this, heads, colSoftmaxShader);
 			}
 		}
 
@@ -656,7 +577,7 @@ globalThis.LmNetwork = function () {
 				@compute @workgroup_size(8, 8, 1)
 				fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 					let outCol = global_id.x; // L
-					let outRow = global_id.y; // L
+					let outRow = global_id.y; // headDim
 					let head = global_id.z; // head index
 					
 					let L = ${L}u;
@@ -683,40 +604,8 @@ globalThis.LmNetwork = function () {
 				}
 			`;
 
-			this.matMulValsAttention_WEBGPU = function(vals, attention) {
-				return executeMatMulValsAttention(this, vals.buffer, attention.buffer, headDim, heads, L, shaderCode);
-			};
-		}
-
-		if (!this.concatHeads_WEBGPU) {
-			const shaderCode = `
-				@group(0) @binding(0) var<storage, read> input: array<f32>;
-				@group(0) @binding(1) var<storage, read_write> output: array<f32>;
-				
-				@compute @workgroup_size(8, 8)
-				fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
-					let col = global_id.x; // L
-					let row = global_id.y; // dimensions
-					
-					let L = ${L}u;
-					let dimensions = ${dimensions}u;
-					let headDim = ${headDim}u;
-					
-					if (col >= L || row >= dimensions) {
-						return;
-					}
-					
-					let head = row / headDim;
-					let rowWithinHead = row % headDim;
-					
-					let inputIndex = head * headDim * L + rowWithinHead * L + col;
-					let outputIndex = row * L + col;
-					output[outputIndex] = input[inputIndex];
-				}
-			`;
-
-			this.concatHeads_WEBGPU = function(valueScaledAttentionByHead) {
-				return executeConcatHeads(this, valueScaledAttentionByHead.buffer, dimensions, headDim, heads, L, shaderCode);
+			this.matMulValsAttention_WEBGPU = function() {
+				return executeMatMulValsAttention(this, headDim, heads, shaderCode);
 			};
 		}
 
@@ -743,8 +632,8 @@ globalThis.LmNetwork = function () {
 				}
 			`;
 
-			this.elementWiseAdd_WEBGPU = function(a, b) {
-				return executeElementWiseAdd(this, a.buffer, b.buffer, dimensions, L, shaderCode);
+			this.elementWiseAdd_WEBGPU = function(a, b, outputBuffer) {
+				return executeElementWiseAdd(this, a.buffer, b.buffer, dimensions, L, shaderCode, outputBuffer);
 			};
 		}
 
@@ -781,8 +670,8 @@ globalThis.LmNetwork = function () {
 				}
 			`;
 
-			this.matMul_FFN1_WEBGPU = function(weights, input) {
-				return executeMatMulFFN1(this, weights.buffer, input.buffer, ffnDim, dimensions, L, shaderCode);
+			this.matMul_FFN1_WEBGPU = function(weights, input, ffnOutputBuffer) {
+				return executeMatMulFFN1(this, weights.buffer, input.buffer, ffnDim, dimensions, L, shaderCode, ffnOutputBuffer);
 			};
 		}
 		
@@ -793,7 +682,7 @@ globalThis.LmNetwork = function () {
 				@group(0) @binding(0) var<storage, read> input: array<f32>;
 				@group(0) @binding(1) var<storage, read_write> output: array<f32>;
 				
-				@compute @workgroup_size(8, 8, 1)
+				@compute @workgroup_size(8, 8)
 				fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 					let col = global_id.x;
 					let row = global_id.y;
@@ -824,7 +713,7 @@ globalThis.LmNetwork = function () {
 				@group(0) @binding(1) var<storage, read> right: array<f32>;
 				@group(0) @binding(2) var<storage, read_write> output: array<f32>;
 				
-				@compute @workgroup_size(8, 8, 1)
+				@compute @workgroup_size(8, 8)
 				fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 					let col = global_id.x;
 					let row = global_id.y;
@@ -853,7 +742,7 @@ globalThis.LmNetwork = function () {
 				@group(0) @binding(1) var<storage, read> input: array<f32>;
 				@group(0) @binding(2) var<storage, read_write> output: array<f32>;
 				
-				@compute @workgroup_size(8, 8, 1)
+				@compute @workgroup_size(8, 8)
 				fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 					let col = global_id.x; // L
 					let row = global_id.y; // dimensions
@@ -895,17 +784,17 @@ globalThis.LmNetwork = function () {
 					let col = global_id.x; // L
 					let row = global_id.y; // vocabSize
 					let L = ${L}u;
+					let activeL = rightEndIndexArr[0] + 1u;
 					let vocabSize = ${vocabSize}u;
 					let dimensions = ${dimensions}u;
 					
-					if (col >= L || row >= vocabSize) {
+					if (col >= activeL || row >= vocabSize) {
 						return;
 					}
 
 					let outputIndex = row * L + col;
 
 					if (teacherModeArr[0] == 0 && col != rightEndIndexArr[0]) {
-						output[outputIndex] = 0.0;
 						return;	
 					}
 					
@@ -915,7 +804,6 @@ globalThis.LmNetwork = function () {
 						let iIndex = i * L + col; // input[i, col]
 						sum = sum + embeddings[eIndex] * input[iIndex];
 					}
-					
 					output[outputIndex] = sum;
 				}
 			`;
@@ -932,7 +820,7 @@ globalThis.LmNetwork = function () {
 				@group(0) @binding(2) var<storage, read> rightEndIndexArr: array<u32>;				
 				@group(0) @binding(3) var<storage, read_write> output: array<f32>;
 				
-				@compute @workgroup_size(8, 8, 1)
+				@compute @workgroup_size(8, 8)
 				fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 					let col = global_id.x; // L
 					let row = global_id.y; // vocab index
@@ -981,7 +869,7 @@ globalThis.LmNetwork = function () {
 				@group(0) @binding(1) var<storage, read> rightEndIndexArr: array<u32>;
 				@group(0) @binding(2) var<storage, read_write> output: array<f32>;
 				
-				@compute @workgroup_size(64, 1, 1)
+				@compute @workgroup_size(64)
 				fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 					let vocabIdx = global_id.x;
 					let vocabSize = ${vocabSize}u;
@@ -1032,7 +920,7 @@ globalThis.LmNetwork = function () {
 	const dimensions = NetworkMeta.dimensions;
 	const heads = NetworkMeta.heads;
 	const headDim = NetworkMeta.dimensions / NetworkMeta.heads;
-	let L = -1;
+	let L = 256;
 	this.tokenVals = tokenVal_GLOBAL;
 	this.tokenValsRecord = {};
 	for (let i = 0; i < this.tokenVals.length; i++) {
@@ -1048,7 +936,9 @@ globalThis.LmNetwork = function () {
 		this.setTransformers();
 
 		this.tokenEmbeddings = this.load_token_embeddings_WEBGPU(this.tokenEmbeddings);
-		this.rmsGamma3 = this.load_rms_weights_WEBGPU(rmsGamma3_GLOBAL);		
+		this.rmsGamma3 = this.load_rms_weights_WEBGPU(rmsGamma3_GLOBAL);
+
+		globalThis.initTransformerBuffers(this, dimensions, heads, L, NetworkMeta.ffnDimMultiplier);
 	}
 
 	this.runQueryThroughModel = (queryArr, nextCorrectTokenIndexToPredict, teacherMode = true, rightEndIndex = -1) => {
@@ -1059,6 +949,7 @@ globalThis.LmNetwork = function () {
 
 		globalThis.executeSetTeacherMode(this, teacherMode);
 		globalThis.executeSetRightEndIndex(this, rightEndIndex);
+		globalThis.LSequence = rightEndIndex + 1;
 
 		this.inputTokenEmbeddingIndices = [];
 		this.tokenOrderInInputSequenceByEmbeddingIndex = {};
@@ -1098,7 +989,7 @@ globalThis.LmNetwork = function () {
 			nextTransformerInput = this.transformers[tIndex].applyTransformChainToInputs(nextTransformerInput);
 		}
 
-		const transforStackOutputPostRMS3 = this.transformers[0].RMSNorm(nextTransformerInput, this.rmsGamma3, 'rms3');
+		const transforStackOutputPostRMS3 = this.transformers[0].RMSNorm(nextTransformerInput, this.rmsGamma3, lmNetwork.preBuffers.rms3);
 		const logitScoresByInputToken = this.matMul_vocab_WEBGPU(this.tokenEmbeddings, transforStackOutputPostRMS3);
 		this.logitScoresByInputTokenPostSoftmax = this.logitSoftmax_WEBGPU(logitScoresByInputToken);
 	}

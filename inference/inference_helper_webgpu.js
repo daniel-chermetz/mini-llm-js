@@ -26,6 +26,44 @@ globalThis.readFloat32Buffer = async function(ctx, srcBuffer, byteSize) {
   return result;
 }
 
+globalThis.initTransformerBuffers = function(ctx, dimensions, heads, L, ffnDimMultiplier) {
+	const F = Float32Array.BYTES_PER_ELEMENT;
+	const dimL = dimensions * L * F;
+	const headL = heads * L * F;
+	const headLL = heads * L * L * F;
+	const ffnDim = dimensions * ffnDimMultiplier;
+	const ffnL = ffnDim * L * F;
+
+	const makeBuf = (size) => ctx.webgpuDevice.createBuffer({
+		size,
+		usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+	});
+
+	ctx.preBuffers = {
+		rms1: makeBuf(dimL),
+		rms2: makeBuf(dimL),
+		rms3: makeBuf(dimL),
+		matMulV: makeBuf(dimL),
+		matMulK: makeBuf(dimL),
+		matMulQ: makeBuf(dimL),
+		ropeK: makeBuf(dimL),
+		ropeQ: makeBuf(dimL),
+		ktq: makeBuf(headLL),
+		colMax: makeBuf(headL),
+		colSum: makeBuf(headL),
+		softmax: makeBuf(headLL),
+		valsAttention: makeBuf(dimL),
+		outputProj: makeBuf(dimL),
+		residual1: makeBuf(dimL),
+		ffn1a: makeBuf(ffnL),
+		silu: makeBuf(ffnL),
+		ffn1b: makeBuf(ffnL),
+		hadamard: makeBuf(ffnL),
+		ffn2: makeBuf(dimL),
+		residual2: makeBuf(dimL),
+	};
+};
+
 globalThis.executeDimDimWeightLoading = function(ctx, flatInput, dimensions, shaderCode) {
 	if (!ctx.dimDim_weight_loading_pipeline) {
 		const dimDimShaderModule = ctx.webgpuDevice.createShaderModule({ code: shaderCode });
@@ -308,7 +346,8 @@ globalThis.executeSetInputTokenEmbeddings = function(ctx, indicesArray, tokenEmb
 			entries: [
 				{ binding: 0, resource: { buffer: ctx.indicesBuffer_executeSetInputTokenEmbeddings } },
 				{ binding: 1, resource: { buffer: tokenEmbeddingsBuffer } },
-				{ binding: 2, resource: { buffer: ctx.outputBuffer_executeSetInputTokenEmbeddings } },
+				{ binding: 2, resource: { buffer: ctx.rightEndIndexBuffer } },
+				{ binding: 3, resource: { buffer: ctx.outputBuffer_executeSetInputTokenEmbeddings } },
 			],
 		});	
 	}
@@ -318,52 +357,14 @@ globalThis.executeSetInputTokenEmbeddings = function(ctx, indicesArray, tokenEmb
 	passEncoder.setPipeline(ctx.executeSetInputTokenEmbeddings_pipeline);
 	passEncoder.setBindGroup(0, ctx.bindGroup_executeSetInputTokenEmbeddings);
 	
-	const workgroupsX = Math.ceil(L / 8);
+	const workgroupsX = Math.ceil(globalThis.LSequence / 8);
 	const workgroupsY = Math.ceil(dimensions / 8);
 	passEncoder.dispatchWorkgroups(workgroupsX, workgroupsY);
 
-	return {
-		buffer: ctx.outputBuffer_executeSetInputTokenEmbeddings,
-	};
+	return { buffer: ctx.outputBuffer_executeSetInputTokenEmbeddings };
 };
 
-globalThis.executeSetInputs = function(ctx, xInputBuffer, dimensions, L, shaderCode) {
-	if (!ctx.executeSetInputs_pipeline) {
-		const shaderModule = ctx.webgpuDevice.createShaderModule({ code: shaderCode });
-		
-		ctx.executeSetInputs_pipeline = ctx.webgpuDevice.createComputePipeline({
-			layout: 'auto',
-			compute: { module: shaderModule, entryPoint: 'main' },
-		});
-	}
-
-	const outputSize = dimensions * L * 4;
-	const outputBuffer = ctx.webgpuDevice.createBuffer({
-		size: outputSize,
-		usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
-	});
-
-	const bindGroup = ctx.webgpuDevice.createBindGroup({
-		layout: ctx.executeSetInputs_pipeline.getBindGroupLayout(0),
-		entries: [
-			{ binding: 0, resource: { buffer: xInputBuffer } },
-			{ binding: 1, resource: { buffer: outputBuffer } },
-		],
-	});
-
-	passEncoder.setPipeline(ctx.executeSetInputs_pipeline);
-	passEncoder.setBindGroup(0, bindGroup);
-	
-	const workgroupsX = Math.ceil(L / 8);
-	const workgroupsY = Math.ceil(dimensions / 8);
-	passEncoder.dispatchWorkgroups(workgroupsX, workgroupsY);
-
-	return {
-		buffer: outputBuffer,
-	};
-};
-
-globalThis.executeRMSNorm = function(ctx, xInputsBuffer, rmsGammaBuffer, dimensions, L, shaderCode) {
+globalThis.executeRMSNorm = function(ctx, xInputsBuffer, rmsGammaBuffer, dimensions, L, shaderCode, rmsOutputBuffer) {
 	if (!ctx.executeRMSNorm_pipeline) {
 		const shaderModule = ctx.webgpuDevice.createShaderModule({ code: shaderCode });
 		
@@ -372,35 +373,28 @@ globalThis.executeRMSNorm = function(ctx, xInputsBuffer, rmsGammaBuffer, dimensi
 			compute: { module: shaderModule, entryPoint: 'main' },
 		});
 	}
-	
-	const outputSize = dimensions * L * 4;
-	const outputBuffer = ctx.webgpuDevice.createBuffer({
-		size: outputSize,
-		usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
-	});
 
 	const bindGroup = ctx.webgpuDevice.createBindGroup({
 		layout: ctx.executeRMSNorm_pipeline.getBindGroupLayout(0),
 		entries: [
 			{ binding: 0, resource: { buffer: xInputsBuffer } },
 			{ binding: 1, resource: { buffer: rmsGammaBuffer } },
-			{ binding: 2, resource: { buffer: outputBuffer } },
+			{ binding: 2, resource: { buffer: ctx.rightEndIndexBuffer } },
+			{ binding: 3, resource: { buffer: rmsOutputBuffer } },
 		],
 	});
 
 	passEncoder.setPipeline(ctx.executeRMSNorm_pipeline);
 	passEncoder.setBindGroup(0, bindGroup);
 	
-	const workgroupsX = Math.ceil(L / 8);
+	const workgroupsX = Math.ceil(globalThis.LSequence / 8);
 	const workgroupsY = Math.ceil(dimensions / 8);
 	passEncoder.dispatchWorkgroups(workgroupsX, workgroupsY);
 
-	return {
-		buffer: outputBuffer,
-	};
+	return { buffer: rmsOutputBuffer };
 };
 
-globalThis.executeMatMul_dim_L_dim_dim = function(ctx, aBuffer, bBuffer, dimensions, L, shaderCode) {
+globalThis.executeMatMul_dim_L_dim_dim = function(ctx, aBuffer, bBuffer, dimensions, L, shaderCode, outputBuffer) {
 	if (!ctx.executeMatMul_Dim_L_Dim_Dim_pipeline) {
 		const shaderModule = ctx.webgpuDevice.createShaderModule({ code: shaderCode });
 		
@@ -410,68 +404,24 @@ globalThis.executeMatMul_dim_L_dim_dim = function(ctx, aBuffer, bBuffer, dimensi
 		});
 	}
 
-	const outputSize = dimensions * L * 4;
-	const outputBuffer = ctx.webgpuDevice.createBuffer({
-		size: outputSize,
-		usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
-	});
-
 	const bindGroup = ctx.webgpuDevice.createBindGroup({
 		layout: ctx.executeMatMul_Dim_L_Dim_Dim_pipeline.getBindGroupLayout(0),
 		entries: [
 			{ binding: 0, resource: { buffer: aBuffer } },
 			{ binding: 1, resource: { buffer: bBuffer } },
-			{ binding: 2, resource: { buffer: outputBuffer } },
+			{ binding: 2, resource: { buffer: ctx.rightEndIndexBuffer } },			
+			{ binding: 3, resource: { buffer: outputBuffer } },
 		],
 	});
 
 	passEncoder.setPipeline(ctx.executeMatMul_Dim_L_Dim_Dim_pipeline);
 	passEncoder.setBindGroup(0, bindGroup);
 	
-	const workgroupsX = Math.ceil(L / 8);
+	const workgroupsX = Math.ceil(globalThis.LSequence / 8);
 	const workgroupsY = Math.ceil(dimensions / 8);
 	passEncoder.dispatchWorkgroups(workgroupsX, workgroupsY);
 
-	return {
-		buffer: outputBuffer,
-	};
-};
-
-globalThis.executeSplitVKQByHead = function(ctx, inputBuffer, headDim, heads, L, shaderCode) {
-	if (!ctx.executeSplitVKQByHead_pipeline) {
-		const shaderModule = ctx.webgpuDevice.createShaderModule({ code: shaderCode });
-	
-		ctx.executeSplitVKQByHead_pipeline = ctx.webgpuDevice.createComputePipeline({
-			layout: 'auto',
-			compute: { module: shaderModule, entryPoint: 'main' },
-		});
-	}
-
-	const outputSize = heads * headDim * L * 4;
-	const outputBuffer = ctx.webgpuDevice.createBuffer({
-		size: outputSize,
-		usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
-	});
-
-	const bindGroup = ctx.webgpuDevice.createBindGroup({
-		layout: ctx.executeSplitVKQByHead_pipeline.getBindGroupLayout(0),
-		entries: [
-			{ binding: 0, resource: { buffer: inputBuffer } },
-			{ binding: 1, resource: { buffer: outputBuffer } },
-		],
-	});
-
-	passEncoder.setPipeline(ctx.executeSplitVKQByHead_pipeline);
-	passEncoder.setBindGroup(0, bindGroup);
-	
-	const workgroupsX = Math.ceil(L / 8);
-	const workgroupsY = Math.ceil(headDim / 8);
-	const workgroupsZ = heads;
-	passEncoder.dispatchWorkgroups(workgroupsX, workgroupsY, workgroupsZ);
-
-	return {
-		buffer: outputBuffer,
-	};
+	return { buffer: outputBuffer };
 };
 
 globalThis.executeLoadPrecomputedTheta = function(ctx, flatData, rows, cols) {
@@ -488,7 +438,7 @@ globalThis.executeLoadPrecomputedTheta = function(ctx, flatData, rows, cols) {
 	};
 };
 
-globalThis.executeRoPE = function(ctx, inputBuffer, thetaBuffer, headDim, heads, L, shaderCode) {
+globalThis.executeRoPE = function(ctx, inputBuffer, thetaBuffer, headDim, heads, L, shaderCode, ropeOutputBuffer) {
 	if (!ctx.executeRoPE_pipeline) {
 		const shaderModule = ctx.webgpuDevice.createShaderModule({ code: shaderCode });
 	
@@ -498,35 +448,30 @@ globalThis.executeRoPE = function(ctx, inputBuffer, thetaBuffer, headDim, heads,
 		});
 	}
 
-	const outputSize = heads * headDim * L * 4;
-		const outputBuffer = ctx.webgpuDevice.createBuffer({
-		size: outputSize,
-		usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
-	});
-
 	const bindGroup = ctx.webgpuDevice.createBindGroup({
 		layout: ctx.executeRoPE_pipeline.getBindGroupLayout(0),
 		entries: [
 			{ binding: 0, resource: { buffer: inputBuffer } },
 			{ binding: 1, resource: { buffer: thetaBuffer } },
-			{ binding: 2, resource: { buffer: outputBuffer } },
+			{ binding: 2, resource: { buffer: ctx.rightEndIndexBuffer } },
+			{ binding: 3, resource: { buffer: ropeOutputBuffer } },
 		],
 	});
 
 	passEncoder.setPipeline(ctx.executeRoPE_pipeline);
 	passEncoder.setBindGroup(0, bindGroup);
 	
-	const workgroupsX = Math.ceil(L / 8);
+	const workgroupsX = Math.ceil(globalThis.LSequence / 8);
 	const workgroupsY = Math.ceil(headDim / 8);
 	const workgroupsZ = heads;
 	passEncoder.dispatchWorkgroups(workgroupsX, workgroupsY, workgroupsZ);
 
 	return {
-		buffer: outputBuffer,
+		buffer: ropeOutputBuffer,
 	};
 };
 
-globalThis.executeKtQ = function(ctx, keysBuffer, queriesBuffer, headDim, heads, L, shaderCode) {
+globalThis.executeKtQ = function(ctx, heads, shaderCode) {
 	if (!ctx.executeKtQ_pipeline) {
 		const shaderModule = ctx.webgpuDevice.createShaderModule({ code: shaderCode });
 	
@@ -534,75 +479,30 @@ globalThis.executeKtQ = function(ctx, keysBuffer, queriesBuffer, headDim, heads,
 			layout: 'auto',
 			compute: { module: shaderModule, entryPoint: 'main' },
 		});
-	}
 
-	const outputSize = heads * L * L * 4;
-	const outputBuffer = ctx.webgpuDevice.createBuffer({
-		size: outputSize,
-		usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
-	});
-
-	const bindGroup = ctx.webgpuDevice.createBindGroup({
-		layout: ctx.executeKtQ_pipeline.getBindGroupLayout(0),
-		entries: [
-			{ binding: 0, resource: { buffer: keysBuffer } },
-			{ binding: 1, resource: { buffer: queriesBuffer } },
-			{ binding: 2, resource: { buffer: outputBuffer } },
-		],
-	});
-
-	passEncoder.setPipeline(ctx.executeKtQ_pipeline);
-	passEncoder.setBindGroup(0, bindGroup);
-	
-	const workgroupsX = Math.ceil(L / 8);
-	const workgroupsY = Math.ceil(L / 8);
-	const workgroupsZ = heads;
-	passEncoder.dispatchWorkgroups(workgroupsX, workgroupsY, workgroupsZ);
-
-	return {
-		buffer: outputBuffer,
-	};
-};
-
-globalThis.executeScaleAndMask = function(ctx, inputBuffer, heads, L, shaderCode) {
-	if (!ctx.executeScaleAndMask_pipeline) {
-		const shaderModule = ctx.webgpuDevice.createShaderModule({ code: shaderCode });
-		
-		ctx.executeScaleAndMask_pipeline = ctx.webgpuDevice.createComputePipeline({
-			layout: 'auto',
-			compute: { module: shaderModule, entryPoint: 'main' },
+		ctx.executeKtQ_bindGroup = ctx.webgpuDevice.createBindGroup({
+			layout: ctx.executeKtQ_pipeline.getBindGroupLayout(0),
+			entries: [
+				{ binding: 0, resource: { buffer: ctx.preBuffers.ropeK } },
+				{ binding: 1, resource: { buffer: ctx.preBuffers.ropeQ } },
+				{ binding: 2, resource: { buffer: ctx.rightEndIndexBuffer } },
+				{ binding: 3, resource: { buffer: ctx.preBuffers.ktq } },
+			],
 		});
 	}
 
-	const outputSize = heads * L * L * 4;
-		const outputBuffer = ctx.webgpuDevice.createBuffer({
-		size: outputSize,
-		usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
-	});
-
-	const bindGroup = ctx.webgpuDevice.createBindGroup({
-		layout: ctx.executeScaleAndMask_pipeline.getBindGroupLayout(0),
-		entries: [
-			{ binding: 0, resource: { buffer: inputBuffer } },
-			{ binding: 1, resource: { buffer: outputBuffer } },
-		],
-	});
-
-	passEncoder.setPipeline(ctx.executeScaleAndMask_pipeline);
-	passEncoder.setBindGroup(0, bindGroup);
+	passEncoder.setPipeline(ctx.executeKtQ_pipeline);
+	passEncoder.setBindGroup(0, ctx.executeKtQ_bindGroup);
 	
-	const workgroupsX = Math.ceil(L / 8);
-	const workgroupsY = Math.ceil(L / 8);
+	const workgroupsX = Math.ceil(globalThis.LSequence / 8);
+	const workgroupsY = Math.ceil(globalThis.LSequence / 8);
 	const workgroupsZ = heads;
 	passEncoder.dispatchWorkgroups(workgroupsX, workgroupsY, workgroupsZ);
 
-	return {
-		buffer: outputBuffer,
-	};
+	return { buffer: ctx.preBuffers.ktq };
 };
 
-// const colMax = executeColMax(this, attentionScores.buffer, heads, L, colMaxShader);
-globalThis.executeColMax = (ctx, attentionScoresBuffer, heads, L, shaderCode) => {
+globalThis.executeColMax = (ctx, heads, L, shaderCode) => {
 	if (!ctx.executeColMax_pipeline) {
 		const shaderModule = ctx.webgpuDevice.createShaderModule({ code: shaderCode });
 	
@@ -610,33 +510,25 @@ globalThis.executeColMax = (ctx, attentionScoresBuffer, heads, L, shaderCode) =>
 			layout: 'auto',
 			compute: { module: shaderModule, entryPoint: 'main' },
 		});
+
+		ctx.executeColMax_bindGroup = ctx.webgpuDevice.createBindGroup({
+		layout: ctx.executeColMax_pipeline.getBindGroupLayout(0),
+			entries: [
+				{ binding: 0, resource: { buffer: ctx.preBuffers.ktq } },
+				{ binding: 1, resource: { buffer: ctx.rightEndIndexBuffer } },			
+				{ binding: 2, resource: { buffer: ctx.preBuffers.colMax } },
+			],
+		});
 	}
 
-	const outputSize = heads * L * Float32Array.BYTES_PER_ELEMENT;
-	const outputBuffer = ctx.webgpuDevice.createBuffer({
-		size: outputSize,
-		usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
-	});
-
-	const bindGroup = ctx.webgpuDevice.createBindGroup({
-		layout: ctx.executeColMax_pipeline.getBindGroupLayout(0),
-		entries: [
-			{ binding: 0, resource: { buffer: attentionScoresBuffer } },
-			{ binding: 1, resource: { buffer: outputBuffer } },
-		],
-	});
-
 	passEncoder.setPipeline(ctx.executeColMax_pipeline);
-	passEncoder.setBindGroup(0, bindGroup);
+	passEncoder.setBindGroup(0, ctx.executeColMax_bindGroup);
 	passEncoder.dispatchWorkgroups(Math.ceil(L * heads / 32));
 
-	return {
-		buffer: outputBuffer,
-	};
+	return { buffer: ctx.preBuffers.colMax };
 }
 
-// const colSum = executeColSum(this, attentionScores.buffer, colMax.buffer, heads, L, colSumShader);
-globalThis.executeColSum = (ctx, attentionScoresBuffer, colMaxBuffer, heads, L, shaderCode) => {
+globalThis.executeColSum = (ctx, heads, L, shaderCode) => {
 	if (!ctx.executeColSum_pipeline) {
 		const shaderModule = ctx.webgpuDevice.createShaderModule({ code: shaderCode });
 	
@@ -644,34 +536,26 @@ globalThis.executeColSum = (ctx, attentionScoresBuffer, colMaxBuffer, heads, L, 
 			layout: 'auto',
 			compute: { module: shaderModule, entryPoint: 'main' },
 		});
+
+		ctx.executeColSum_bindGroup = ctx.webgpuDevice.createBindGroup({
+			layout: ctx.executeColSum_pipeline.getBindGroupLayout(0),
+			entries: [
+				{ binding: 0, resource: { buffer: ctx.preBuffers.ktq } },
+				{ binding: 1, resource: { buffer: ctx.preBuffers.colMax } },
+				{ binding: 2, resource: { buffer: ctx.rightEndIndexBuffer } },			
+				{ binding: 3, resource: { buffer: ctx.preBuffers.colSum } },
+			],
+		});
 	}
 
-	const outputSize = heads * L * Float32Array.BYTES_PER_ELEMENT;
-	const outputBuffer = ctx.webgpuDevice.createBuffer({
-		size: outputSize,
-		usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
-	});
-
-	const bindGroup = ctx.webgpuDevice.createBindGroup({
-		layout: ctx.executeColSum_pipeline.getBindGroupLayout(0),
-		entries: [
-			{ binding: 0, resource: { buffer: attentionScoresBuffer } },
-			{ binding: 1, resource: { buffer: colMaxBuffer } },
-			{ binding: 2, resource: { buffer: outputBuffer } },
-		],
-	});
-
 	passEncoder.setPipeline(ctx.executeColSum_pipeline);
-	passEncoder.setBindGroup(0, bindGroup);
+	passEncoder.setBindGroup(0, ctx.executeColSum_bindGroup);
 	passEncoder.dispatchWorkgroups(Math.ceil(L * heads / 32));
 
-	return {
-		buffer: outputBuffer,
-	};
+	return { buffer: ctx.preBuffers.colSum };
 }
 
-// return executeSoftmaxByHead(this, attentionScores.buffer, colMax.buffer, colSum.buffer, heads, L, colSoftmaxShader);
-globalThis.executeSoftmaxByHead = (ctx, attentionScoresBuffer, colMaxBuffer, colSumBuffer, heads, L, shaderCode) => {
+globalThis.executeSoftmaxByHead = (ctx, heads, shaderCode) => {
 	if (!ctx.executeSoftmaxByHead_pipeline) {
 		const shaderModule = ctx.webgpuDevice.createShaderModule({ code: shaderCode });
 	
@@ -679,34 +563,31 @@ globalThis.executeSoftmaxByHead = (ctx, attentionScoresBuffer, colMaxBuffer, col
 			layout: 'auto',
 			compute: { module: shaderModule, entryPoint: 'main' },
 		});
+
+		ctx.executeSoftmaxByHead_bindGroup = ctx.webgpuDevice.createBindGroup({
+			layout: ctx.executeSoftmaxByHead_pipeline.getBindGroupLayout(0),
+			entries: [
+				{ binding: 0, resource: { buffer: ctx.preBuffers.ktq } },
+				{ binding: 1, resource: { buffer: ctx.preBuffers.colMax } },
+				{ binding: 2, resource: { buffer: ctx.preBuffers.colSum } },
+				{ binding: 3, resource: { buffer: ctx.rightEndIndexBuffer } },				
+				{ binding: 4, resource: { buffer: ctx.preBuffers.softmax } },
+			],
+		});
 	}
 
-	const outputSize = heads * L * L * Float32Array.BYTES_PER_ELEMENT;
-	const outputBuffer = ctx.webgpuDevice.createBuffer({
-		size: outputSize,
-		usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
-	});
-
-	const bindGroup = ctx.webgpuDevice.createBindGroup({
-		layout: ctx.executeSoftmaxByHead_pipeline.getBindGroupLayout(0),
-		entries: [
-			{ binding: 0, resource: { buffer: attentionScoresBuffer } },
-			{ binding: 1, resource: { buffer: colMaxBuffer } },
-			{ binding: 2, resource: { buffer: colSumBuffer } },			
-			{ binding: 3, resource: { buffer: outputBuffer } },
-		],
-	});
-
 	passEncoder.setPipeline(ctx.executeSoftmaxByHead_pipeline);
-	passEncoder.setBindGroup(0, bindGroup);
-	passEncoder.dispatchWorkgroups(Math.ceil(L / 8), Math.ceil(L / 8), heads);
+	passEncoder.setBindGroup(0, ctx.executeSoftmaxByHead_bindGroup);
+	passEncoder.dispatchWorkgroups(
+		Math.ceil(globalThis.LSequence / 8), 
+		Math.ceil(globalThis.LSequence / 8), 
+		heads
+	);
 
-	return {
-		buffer: outputBuffer,
-	};
+	return { buffer: ctx.preBuffers.softmax };
 };
 
-globalThis.executeMatMulValsAttention = (ctx, valsBuffer, attentionBuffer, headDim, heads, L, shaderCode) => {
+globalThis.executeMatMulValsAttention = (ctx, headDim, heads, shaderCode) => {
 	if (!ctx.executeMatMulValsAttention_pipeline) {
 		const shaderModule = ctx.webgpuDevice.createShaderModule({ code: shaderCode });
 		
@@ -714,73 +595,30 @@ globalThis.executeMatMulValsAttention = (ctx, valsBuffer, attentionBuffer, headD
 			layout: 'auto',
 			compute: { module: shaderModule, entryPoint: 'main' },
 		});
+
+		ctx.executeMatMulValsAttention_bindGroup = ctx.webgpuDevice.createBindGroup({
+			layout: ctx.executeMatMulValsAttention_pipeline.getBindGroupLayout(0),
+			entries: [
+				{ binding: 0, resource: { buffer: ctx.preBuffers.matMulV } },
+				{ binding: 1, resource: { buffer: ctx.preBuffers.softmax } },
+				{ binding: 2, resource: { buffer: ctx.preBuffers.valsAttention } },
+			],
+		});
 	}
 
-	const outputSize = heads * headDim * L * Float32Array.BYTES_PER_ELEMENT;
-	const outputBuffer = ctx.webgpuDevice.createBuffer({
-		size: outputSize,
-		usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
-	});
-
-	const bindGroup = ctx.webgpuDevice.createBindGroup({
-		layout: ctx.executeMatMulValsAttention_pipeline.getBindGroupLayout(0),
-		entries: [
-			{ binding: 0, resource: { buffer: valsBuffer } },
-			{ binding: 1, resource: { buffer: attentionBuffer } },
-			{ binding: 2, resource: { buffer: outputBuffer } },
-		],
-	});
-
 	passEncoder.setPipeline(ctx.executeMatMulValsAttention_pipeline);
-	passEncoder.setBindGroup(0, bindGroup);
+	passEncoder.setBindGroup(0, ctx.executeMatMulValsAttention_bindGroup);
 	
-	const workgroupsX = Math.ceil(L / 8);
+	const workgroupsX = Math.ceil(globalThis.LSequence / 8);
 	const workgroupsY = Math.ceil(headDim / 8);
 	const workgroupsZ = heads;
 	passEncoder.dispatchWorkgroups(workgroupsX, workgroupsY, workgroupsZ);
 
-	return {
-		buffer: outputBuffer,
-	};
+	return { buffer: ctx.preBuffers.valsAttention };
 };
 
-globalThis.executeConcatHeads = (ctx, inputBuffer, dimensions, headDim, heads, L, shaderCode) => {
-	if (!ctx.executeConcatHeads_pipeline) {
-		const shaderModule = ctx.webgpuDevice.createShaderModule({ code: shaderCode });
-	
-		ctx.executeConcatHeads_pipeline = ctx.webgpuDevice.createComputePipeline({
-			layout: 'auto',
-			compute: { module: shaderModule, entryPoint: 'main' },
-		});
-	}
-
-	const outputSize = dimensions * L * Float32Array.BYTES_PER_ELEMENT;
-	const outputBuffer = ctx.webgpuDevice.createBuffer({
-		size: outputSize,
-		usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
-	});
-
-	const bindGroup = ctx.webgpuDevice.createBindGroup({
-		layout: ctx.executeConcatHeads_pipeline.getBindGroupLayout(0),
-		entries: [
-			{ binding: 0, resource: { buffer: inputBuffer } },
-			{ binding: 1, resource: { buffer: outputBuffer } },
-		],
-	});
-
-	passEncoder.setPipeline(ctx.executeConcatHeads_pipeline);
-	passEncoder.setBindGroup(0, bindGroup);
-	
-	const workgroupsX = Math.ceil(L / 8);
-	const workgroupsY = Math.ceil(dimensions / 8);
-	passEncoder.dispatchWorkgroups(workgroupsX, workgroupsY, 1);
-
-	return {
-		buffer: outputBuffer,
-	};
-};
-
-globalThis.executeElementWiseAdd = (ctx, aBuffer, bBuffer, dimensions, L, shaderCode) => {
+// TODO: clean signature, some params not longer needed
+globalThis.executeElementWiseAdd = (ctx, aBuffer, bBuffer, dimensions, L, shaderCode, outputBuffer) => {
 	if (!ctx.executeElementWiseAdd_pipeline) {
 		const shaderModule = ctx.webgpuDevice.createShaderModule({ code: shaderCode });
 		
@@ -789,12 +627,6 @@ globalThis.executeElementWiseAdd = (ctx, aBuffer, bBuffer, dimensions, L, shader
 			compute: { module: shaderModule, entryPoint: 'main' },
 		});
 	}
-
-	const outputSize = dimensions * L * Float32Array.BYTES_PER_ELEMENT;
-	const outputBuffer = ctx.webgpuDevice.createBuffer({
-		size: outputSize,
-		usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
-	});
 
 	const bindGroup = ctx.webgpuDevice.createBindGroup({
 		layout: ctx.executeElementWiseAdd_pipeline.getBindGroupLayout(0),
@@ -808,16 +640,15 @@ globalThis.executeElementWiseAdd = (ctx, aBuffer, bBuffer, dimensions, L, shader
 	passEncoder.setPipeline(ctx.executeElementWiseAdd_pipeline);
 	passEncoder.setBindGroup(0, bindGroup);
 	
-	const workgroupsX = Math.ceil(L / 8);
+	const workgroupsX = Math.ceil(globalThis.LSequence / 8);
 	const workgroupsY = Math.ceil(dimensions / 8);
 	passEncoder.dispatchWorkgroups(workgroupsX, workgroupsY, 1);
 
-	return {
-		buffer: outputBuffer,
-	};
+	return { buffer: outputBuffer };
 };
 
-globalThis.executeMatMulFFN1 = (ctx, weightsBuffer, inputBuffer, ffnDim, dimensions, L, shaderCode) => {
+// TODO: clean signature, some params not longer needed
+globalThis.executeMatMulFFN1 = (ctx, weightsBuffer, inputBuffer, ffnDim, dimensions, L, shaderCode, ffnOutputBuffer) => {
 	if (!ctx.executeMatMulFFN1_pipeline) {	
 		const shaderModule = ctx.webgpuDevice.createShaderModule({ code: shaderCode });
 		
@@ -827,33 +658,26 @@ globalThis.executeMatMulFFN1 = (ctx, weightsBuffer, inputBuffer, ffnDim, dimensi
 		});
 	}
 
-	const outputSize = ffnDim * L * Float32Array.BYTES_PER_ELEMENT;
-	const outputBuffer = ctx.webgpuDevice.createBuffer({
-		size: outputSize,
-		usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
-	});
-
 	const bindGroup = ctx.webgpuDevice.createBindGroup({
 		layout: ctx.executeMatMulFFN1_pipeline.getBindGroupLayout(0),
 		entries: [
 			{ binding: 0, resource: { buffer: weightsBuffer } },
 			{ binding: 1, resource: { buffer: inputBuffer } },
-			{ binding: 2, resource: { buffer: outputBuffer } },
+			{ binding: 2, resource: { buffer: ffnOutputBuffer } },
 		],
 	});
 
 	passEncoder.setPipeline(ctx.executeMatMulFFN1_pipeline);
 	passEncoder.setBindGroup(0, bindGroup);
 	
-	const workgroupsX = Math.ceil(L / 8);
+	const workgroupsX = Math.ceil(globalThis.LSequence / 8);
 	const workgroupsY = Math.ceil(ffnDim / 8);
 	passEncoder.dispatchWorkgroups(workgroupsX, workgroupsY, 1);
 
-	return {
-		buffer: outputBuffer,
-	};
+	return { buffer: ffnOutputBuffer };
 };
 
+// TODO: clean signature, some params not longer needed
 globalThis.executeSilu = (ctx, inputBuffer, ffnDim, L, shaderCode) => {
 	if (!ctx.executeSilu_pipeline) {
 		const shaderModule = ctx.webgpuDevice.createShaderModule({ code: shaderCode });
@@ -862,34 +686,27 @@ globalThis.executeSilu = (ctx, inputBuffer, ffnDim, L, shaderCode) => {
 			layout: 'auto',
 			compute: { module: shaderModule, entryPoint: 'main' },
 		});
+
+		ctx.executeSilu_bindGroup = ctx.webgpuDevice.createBindGroup({
+			layout: ctx.executeSilu_pipeline.getBindGroupLayout(0),
+			entries: [
+				{ binding: 0, resource: { buffer: ctx.preBuffers.ffn1a } },
+				{ binding: 1, resource: { buffer: ctx.preBuffers.silu } },
+			],
+		});
 	}
 
-	const outputSize = ffnDim * L * Float32Array.BYTES_PER_ELEMENT;
-	const outputBuffer = ctx.webgpuDevice.createBuffer({
-		size: outputSize,
-		usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
-	});
-
-	const bindGroup = ctx.webgpuDevice.createBindGroup({
-		layout: ctx.executeSilu_pipeline.getBindGroupLayout(0),
-		entries: [
-			{ binding: 0, resource: { buffer: inputBuffer } },
-			{ binding: 1, resource: { buffer: outputBuffer } },
-		],
-	});
-
 	passEncoder.setPipeline(ctx.executeSilu_pipeline);
-	passEncoder.setBindGroup(0, bindGroup);
+	passEncoder.setBindGroup(0, ctx.executeSilu_bindGroup);
 	
-	const workgroupsX = Math.ceil(L / 8);
+	const workgroupsX = Math.ceil(globalThis.LSequence / 8);
 	const workgroupsY = Math.ceil(ffnDim / 8);
-	passEncoder.dispatchWorkgroups(workgroupsX, workgroupsY, 1);
+	passEncoder.dispatchWorkgroups(workgroupsX, workgroupsY);
 
-	return {
-		buffer: outputBuffer,
-	};
+	return { buffer: ctx.preBuffers.silu };
 };
 
+// TODO: clean signature, some params not longer needed
 globalThis.executeHadamard = (ctx, aBuffer, bBuffer, ffnDim, L, shaderCode) => {
 	if (!ctx.executeHadamard_pipeline) {
 		const shaderModule = ctx.webgpuDevice.createShaderModule({ code: shaderCode });
@@ -898,35 +715,28 @@ globalThis.executeHadamard = (ctx, aBuffer, bBuffer, ffnDim, L, shaderCode) => {
 			layout: 'auto',
 			compute: { module: shaderModule, entryPoint: 'main' },
 		});
+
+	 	ctx.executeHadamard_bindGroup = ctx.webgpuDevice.createBindGroup({
+			layout: ctx.executeHadamard_pipeline.getBindGroupLayout(0),
+			entries: [
+				{ binding: 0, resource: { buffer: ctx.preBuffers.silu } },
+				{ binding: 1, resource: { buffer: ctx.preBuffers.ffn1b } },
+				{ binding: 2, resource: { buffer: ctx.preBuffers.hadamard } },
+			],
+		});		
 	}
 
-	const outputSize = ffnDim * L * Float32Array.BYTES_PER_ELEMENT;
-	const outputBuffer = ctx.webgpuDevice.createBuffer({
-		size: outputSize,
-		usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
-	});
-
-	const bindGroup = ctx.webgpuDevice.createBindGroup({
-		layout: ctx.executeHadamard_pipeline.getBindGroupLayout(0),
-		entries: [
-			{ binding: 0, resource: { buffer: aBuffer } },
-			{ binding: 1, resource: { buffer: bBuffer } },
-			{ binding: 2, resource: { buffer: outputBuffer } },
-		],
-	});
-
 	passEncoder.setPipeline(ctx.executeHadamard_pipeline);
-	passEncoder.setBindGroup(0, bindGroup);
+	passEncoder.setBindGroup(0, ctx.executeHadamard_bindGroup);
 	
-	const workgroupsX = Math.ceil(L / 8);
+	const workgroupsX = Math.ceil(globalThis.LSequence / 8);
 	const workgroupsY = Math.ceil(ffnDim / 8);
-	passEncoder.dispatchWorkgroups(workgroupsX, workgroupsY, 1);
+	passEncoder.dispatchWorkgroups(workgroupsX, workgroupsY);
 
-	return {
-		buffer: outputBuffer,
-	};
+	return { buffer: ctx.preBuffers.hadamard };
 };
 
+// TODO: clean signature, some params not longer needed
 globalThis.executeMatMulFFN2 = (ctx, weightsBuffer, inputBuffer, dimensions, ffnDim, L, shaderCode) => {
 	if (!ctx.executeMatMulFFN2_pipeline) {
 		const shaderModule = ctx.webgpuDevice.createShaderModule({ code: shaderCode });
@@ -937,32 +747,26 @@ globalThis.executeMatMulFFN2 = (ctx, weightsBuffer, inputBuffer, dimensions, ffn
 		});
 	}
 
-	const outputBuffer = ctx.webgpuDevice.createBuffer({
-		size: dimensions * L * Float32Array.BYTES_PER_ELEMENT,
-		usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
-	});
-
-	const bindGroup = ctx.webgpuDevice.createBindGroup({
+	ctx.executeMatMulFFN2_bindGroup = ctx.webgpuDevice.createBindGroup({
 		layout: ctx.executeMatMulFFN2_pipeline.getBindGroupLayout(0),
 		entries: [
 			{ binding: 0, resource: { buffer: weightsBuffer } },
-			{ binding: 1, resource: { buffer: inputBuffer } },
-			{ binding: 2, resource: { buffer: outputBuffer } },
+			{ binding: 1, resource: { buffer: ctx.preBuffers.hadamard } },
+			{ binding: 2, resource: { buffer: ctx.preBuffers.ffn2 } },
 		],
 	});
 
 	passEncoder.setPipeline(ctx.executeMatMulFFN2_pipeline);
-	passEncoder.setBindGroup(0, bindGroup);
+	passEncoder.setBindGroup(0, ctx.executeMatMulFFN2_bindGroup);
 	
-	const workgroupsX = Math.ceil(L / 8);
+	const workgroupsX = Math.ceil(globalThis.LSequence / 8);
 	const workgroupsY = Math.ceil(dimensions / 8);
-	passEncoder.dispatchWorkgroups(workgroupsX, workgroupsY, 1);
+	passEncoder.dispatchWorkgroups(workgroupsX, workgroupsY);
 
-	return {
-		buffer: outputBuffer,
-	};
+	return { buffer: ctx.preBuffers.ffn2 };
 };
 
+// TODO: clean signature, some params not longer needed
 globalThis.executeMatMulVocab = (ctx, embeddingsBuffer, inputBuffer, vocabSize, dimensions, L, shaderCode) => {
 	if (!ctx.executeMatMulVocab_pipeline) {
 		const shaderModule = ctx.webgpuDevice.createShaderModule({ code: shaderCode });
@@ -975,30 +779,28 @@ globalThis.executeMatMulVocab = (ctx, embeddingsBuffer, inputBuffer, vocabSize, 
 		ctx.outputBuffer_executeMatMulVocab = ctx.webgpuDevice.createBuffer({
 			size: vocabSize * L * Float32Array.BYTES_PER_ELEMENT,
 			usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
-		});	
-	}
+		});
 
-	ctx.bindGroup_executeMatMulVocab = ctx.webgpuDevice.createBindGroup({
-		layout: ctx.executeMatMulVocab_pipeline.getBindGroupLayout(0),
-		entries: [
-			{ binding: 0, resource: { buffer: embeddingsBuffer } },
-			{ binding: 1, resource: { buffer: inputBuffer } },
-			{ binding: 2, resource: { buffer: ctx.teacherModeBuffer } },
-			{ binding: 3, resource: { buffer: ctx.rightEndIndexBuffer } },
-			{ binding: 4, resource: { buffer: ctx.outputBuffer_executeMatMulVocab } },
-		],
-	});
+		ctx.bindGroup_executeMatMulVocab = ctx.webgpuDevice.createBindGroup({
+			layout: ctx.executeMatMulVocab_pipeline.getBindGroupLayout(0),
+			entries: [
+				{ binding: 0, resource: { buffer: embeddingsBuffer } },
+				{ binding: 1, resource: { buffer: ctx.preBuffers.rms3 } },
+				{ binding: 2, resource: { buffer: ctx.teacherModeBuffer } },
+				{ binding: 3, resource: { buffer: ctx.rightEndIndexBuffer } },
+				{ binding: 4, resource: { buffer: ctx.outputBuffer_executeMatMulVocab } },
+			],
+		});
+	}
 
 	passEncoder.setPipeline(ctx.executeMatMulVocab_pipeline);
 	passEncoder.setBindGroup(0, ctx.bindGroup_executeMatMulVocab);
 	
-	const workgroupsX = Math.ceil(L / 8);
+	const workgroupsX = Math.ceil(globalThis.LSequence / 8);
 	const workgroupsY = Math.ceil(vocabSize / 8);
-	passEncoder.dispatchWorkgroups(workgroupsX, workgroupsY, 1);
+	passEncoder.dispatchWorkgroups(workgroupsX, workgroupsY);
 
-	return {
-		buffer: ctx.outputBuffer_executeMatMulVocab,
-	};
+	return { buffer: ctx.outputBuffer_executeMatMulVocab };
 };
 
 globalThis.executeLogitSoftmax = (ctx, logitsBuffer, vocabSize, L, shaderCode) => {
@@ -1029,9 +831,9 @@ globalThis.executeLogitSoftmax = (ctx, logitsBuffer, vocabSize, L, shaderCode) =
 	passEncoder.setPipeline(ctx.executeLogitSoftmax_pipeline);
 	passEncoder.setBindGroup(0, ctx.bindGroup_executeLogitSoftmax);
 	
-	const workgroupsX = Math.ceil(L / 8);
+	const workgroupsX = Math.ceil(globalThis.LSequence / 8);
 	const workgroupsY = Math.ceil(vocabSize / 8);
-	passEncoder.dispatchWorkgroups(workgroupsX, workgroupsY, 1);
+	passEncoder.dispatchWorkgroups(workgroupsX, workgroupsY);
 
 	return {
 		buffer: ctx.outputBuffer_executeLogitSoftmax,
@@ -1066,7 +868,7 @@ globalThis.executeExtractPredictions = (ctx, softmaxBuffer, vocabSize, L, rightE
 	passEncoder.setBindGroup(0, ctx.bindGroup_executeExtractPredictions);
 	
 	const workgroupsX = Math.ceil(vocabSize / 64);
-	passEncoder.dispatchWorkgroups(workgroupsX, 1, 1);
+	passEncoder.dispatchWorkgroups(workgroupsX);
 
 	return {
 		buffer: ctx.outputBuffer_executeExtractPredictions,
