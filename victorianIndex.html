@@ -829,7 +829,7 @@
         </div>
 
         <!-- New: Write Story from Scratch -->
-        <div class="write-story-section" style="margin-top: 25px; text-align: center; font-size: 0.95em; color: var(--text-muted);">
+        <div class="write-story-section" style="margin-top: 25px; text-align: center; font-size: 0.95em; color: var(--text-muted); display: none !important;">
             <button id="write-story-btn" style="padding: 12px 24px; font-size: 0.95em; font-weight: 600; border: 2px solid var(--border-color); background-color: white; cursor: pointer; border-radius: 10px; transition: all 0.2s ease; box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.1);">Or enter your own story text...</button>
         </div>
         
@@ -878,10 +878,10 @@
                         <option value="">-- Select --</option>
                     </select>
                     <div class="quick-percentage-buttons">
-                        <button class="quick-percentage-btn" data-percentage="25">25%</button>
-                        <button class="quick-percentage-btn" data-percentage="50">50%</button>
-                        <button class="quick-percentage-btn" data-percentage="75">75%</button>
-                        <button class="quick-percentage-btn" data-percentage="100">100%</button>
+                        <button class="quick-percentage-btn" data-percentage="1">1%</button>
+                        <button class="quick-percentage-btn" data-percentage="2.5">2.5%</button>
+                        <button class="quick-percentage-btn" data-percentage="5">5%</button>
+                        <button class="quick-percentage-btn" data-percentage="7.5">7.5%</button>
                     </div>
                 </div>
             </div>
@@ -3098,7 +3098,7 @@
                 </div>
             `).removeClass('hidden');
             
-            $('.write-story-section').removeClass('hidden');
+            // $('.write-story-section').removeClass('hidden'); // Hidden until BPE script is updated
             
             $configSection.removeClass('hidden');
 
