@@ -26,7 +26,7 @@ globalThis.readFloat32Buffer = async function(ctx, srcBuffer, byteSize) {
   return result;
 }
 
-globalThis.initTransformerBuffers = function(ctx, dimensions, heads, L, ffnDimMultiplier) {
+globalThis.initTransformerBuffers = function(ctx, dimensions, heads, L, ffnDimMultiplier, numTransformers) {
 	const F = Float32Array.BYTES_PER_ELEMENT;
 	const dimL = dimensions * L * F;
 	const headL = heads * L * F;
@@ -40,20 +40,7 @@ globalThis.initTransformerBuffers = function(ctx, dimensions, heads, L, ffnDimMu
 	});
 
 	ctx.preBuffers = {
-		rms1: makeBuf(dimL),
-		rms2: makeBuf(dimL),
 		rms3: makeBuf(dimL),
-		matMulV: makeBuf(dimL),
-		matMulK: makeBuf(dimL),
-		matMulQ: makeBuf(dimL),
-		ropeK: makeBuf(dimL),
-		ropeQ: makeBuf(dimL),
-		ktq: makeBuf(headLL),
-		colMax: makeBuf(headL),
-		colSum: makeBuf(headL),
-		softmax: makeBuf(headLL),
-		valsAttention: makeBuf(dimL),
-		outputProj: makeBuf(dimL),
 		residual1: makeBuf(dimL),
 		ffn1a: makeBuf(ffnL),
 		silu: makeBuf(ffnL),
@@ -62,6 +49,25 @@ globalThis.initTransformerBuffers = function(ctx, dimensions, heads, L, ffnDimMu
 		ffn2: makeBuf(dimL),
 		residual2: makeBuf(dimL),
 	};
+
+	ctx.preBuffersByTransformer = [];
+	for (let i = 0; i < numTransformers; i++) {
+		ctx.preBuffersByTransformer.push({
+				rms1: makeBuf(dimL),
+				rms2: makeBuf(dimL),
+				matMulV: makeBuf(dimL),
+				matMulK: makeBuf(dimL),
+				matMulQ: makeBuf(dimL),
+				ropeK: makeBuf(dimL),
+				ropeQ: makeBuf(dimL),
+				ktq: makeBuf(headLL),
+				outputProj: makeBuf(dimL),
+				colMax: makeBuf(headL),
+				colSum: makeBuf(headL),
+				softmax: makeBuf(headLL),
+				valsAttention: makeBuf(dimL),
+		});
+	}
 };
 
 globalThis.executeDimDimWeightLoading = function(ctx, flatInput, dimensions, shaderCode) {
@@ -322,6 +328,21 @@ globalThis.executeSetRightEndIndex = function(ctx, rightEndIndex) {
 	};
 };
 
+globalThis.executeSetIsFirstIteration = function(ctx, isFirstIteration) {
+	if (!ctx.firstIterationBuffer) {
+		ctx.firstIterationBuffer = ctx.webgpuDevice.createBuffer({
+			size: Uint32Array.BYTES_PER_ELEMENT,
+			usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+		});
+	}
+	console.log('isFirstIteration: ' + isFirstIteration);
+	ctx.webgpuDevice.queue.writeBuffer(ctx.firstIterationBuffer, 0, new Uint32Array([isFirstIteration ? 1 : 0]));
+
+	return {
+		buffer: ctx.firstIterationBuffer,
+	};
+};
+
 globalThis.executeSetInputTokenEmbeddings = function(ctx, indicesArray, tokenEmbeddingsBuffer, dimensions, L, shaderCode) {	
 	if (!ctx.executeSetInputTokenEmbeddings_pipeline) {
 		const shaderModule = ctx.webgpuDevice.createShaderModule({ code: shaderCode });
@@ -380,14 +401,15 @@ globalThis.executeRMSNorm = function(ctx, xInputsBuffer, rmsGammaBuffer, dimensi
 			{ binding: 0, resource: { buffer: xInputsBuffer } },
 			{ binding: 1, resource: { buffer: rmsGammaBuffer } },
 			{ binding: 2, resource: { buffer: ctx.rightEndIndexBuffer } },
-			{ binding: 3, resource: { buffer: rmsOutputBuffer } },
+			{ binding: 3, resource: { buffer: ctx.firstIterationBuffer } },
+			{ binding: 4, resource: { buffer: rmsOutputBuffer } },
 		],
 	});
 
 	passEncoder.setPipeline(ctx.executeRMSNorm_pipeline);
 	passEncoder.setBindGroup(0, bindGroup);
 	
-	const workgroupsX = Math.ceil(globalThis.LSequence / 8);
+	const workgroupsX = Math.ceil(globalThis.postFirstIteration ? 1 : globalThis.LSequence / 8);
 	const workgroupsY = Math.ceil(dimensions / 8);
 	passEncoder.dispatchWorkgroups(workgroupsX, workgroupsY);
 
@@ -409,15 +431,16 @@ globalThis.executeMatMul_dim_L_dim_dim = function(ctx, aBuffer, bBuffer, dimensi
 		entries: [
 			{ binding: 0, resource: { buffer: aBuffer } },
 			{ binding: 1, resource: { buffer: bBuffer } },
-			{ binding: 2, resource: { buffer: ctx.rightEndIndexBuffer } },			
-			{ binding: 3, resource: { buffer: outputBuffer } },
+			{ binding: 2, resource: { buffer: ctx.rightEndIndexBuffer } },
+			{ binding: 3, resource: { buffer: ctx.firstIterationBuffer } },
+			{ binding: 4, resource: { buffer: outputBuffer } },
 		],
 	});
 
 	passEncoder.setPipeline(ctx.executeMatMul_Dim_L_Dim_Dim_pipeline);
 	passEncoder.setBindGroup(0, bindGroup);
 	
-	const workgroupsX = Math.ceil(globalThis.LSequence / 8);
+	const workgroupsX = Math.ceil(globalThis.postFirstIteration ? 1 : globalThis.LSequence / 8);
 	const workgroupsY = Math.ceil(dimensions / 8);
 	passEncoder.dispatchWorkgroups(workgroupsX, workgroupsY);
 
@@ -454,14 +477,15 @@ globalThis.executeRoPE = function(ctx, inputBuffer, thetaBuffer, headDim, heads,
 			{ binding: 0, resource: { buffer: inputBuffer } },
 			{ binding: 1, resource: { buffer: thetaBuffer } },
 			{ binding: 2, resource: { buffer: ctx.rightEndIndexBuffer } },
-			{ binding: 3, resource: { buffer: ropeOutputBuffer } },
+			{ binding: 3, resource: { buffer: ctx.firstIterationBuffer } },
+			{ binding: 4, resource: { buffer: ropeOutputBuffer } },
 		],
 	});
 
 	passEncoder.setPipeline(ctx.executeRoPE_pipeline);
 	passEncoder.setBindGroup(0, bindGroup);
 	
-	const workgroupsX = Math.ceil(globalThis.LSequence / 8);
+	const workgroupsX = Math.ceil(globalThis.postFirstIteration ? 1 : globalThis.LSequence / 8);
 	const workgroupsY = Math.ceil(headDim / 8);
 	const workgroupsZ = heads;
 	passEncoder.dispatchWorkgroups(workgroupsX, workgroupsY, workgroupsZ);
@@ -471,7 +495,7 @@ globalThis.executeRoPE = function(ctx, inputBuffer, thetaBuffer, headDim, heads,
 	};
 };
 
-globalThis.executeKtQ = function(ctx, heads, shaderCode) {
+globalThis.executeKtQ = function(ctx, heads, shaderCode, tIndex) {
 	if (!ctx.executeKtQ_pipeline) {
 		const shaderModule = ctx.webgpuDevice.createShaderModule({ code: shaderCode });
 	
@@ -479,30 +503,31 @@ globalThis.executeKtQ = function(ctx, heads, shaderCode) {
 			layout: 'auto',
 			compute: { module: shaderModule, entryPoint: 'main' },
 		});
-
-		ctx.executeKtQ_bindGroup = ctx.webgpuDevice.createBindGroup({
-			layout: ctx.executeKtQ_pipeline.getBindGroupLayout(0),
-			entries: [
-				{ binding: 0, resource: { buffer: ctx.preBuffers.ropeK } },
-				{ binding: 1, resource: { buffer: ctx.preBuffers.ropeQ } },
-				{ binding: 2, resource: { buffer: ctx.rightEndIndexBuffer } },
-				{ binding: 3, resource: { buffer: ctx.preBuffers.ktq } },
-			],
-		});
 	}
 
+	const bindGroup = ctx.webgpuDevice.createBindGroup({
+		layout: ctx.executeKtQ_pipeline.getBindGroupLayout(0),
+		entries: [
+			{ binding: 0, resource: { buffer: ctx.preBuffersByTransformer[tIndex].ropeK } },
+			{ binding: 1, resource: { buffer: ctx.preBuffersByTransformer[tIndex].ropeQ } },
+			{ binding: 2, resource: { buffer: ctx.rightEndIndexBuffer } },
+			{ binding: 3, resource: { buffer: ctx.firstIterationBuffer } },			
+			{ binding: 4, resource: { buffer: ctx.preBuffersByTransformer[tIndex].ktq } },
+		],
+	});
+
 	passEncoder.setPipeline(ctx.executeKtQ_pipeline);
-	passEncoder.setBindGroup(0, ctx.executeKtQ_bindGroup);
+	passEncoder.setBindGroup(0, bindGroup);
 	
-	const workgroupsX = Math.ceil(globalThis.LSequence / 8);
+	const workgroupsX = Math.ceil(globalThis.postFirstIteration ? 1 : globalThis.LSequence / 8);
 	const workgroupsY = Math.ceil(globalThis.LSequence / 8);
 	const workgroupsZ = heads;
 	passEncoder.dispatchWorkgroups(workgroupsX, workgroupsY, workgroupsZ);
 
-	return { buffer: ctx.preBuffers.ktq };
+	return { buffer: ctx.preBuffersByTransformer[tIndex].ktq };
 };
 
-globalThis.executeColMax = (ctx, heads, L, shaderCode) => {
+globalThis.executeColMax = (ctx, heads, L, shaderCode, tIndex) => {
 	if (!ctx.executeColMax_pipeline) {
 		const shaderModule = ctx.webgpuDevice.createShaderModule({ code: shaderCode });
 	
@@ -510,25 +535,26 @@ globalThis.executeColMax = (ctx, heads, L, shaderCode) => {
 			layout: 'auto',
 			compute: { module: shaderModule, entryPoint: 'main' },
 		});
-
-		ctx.executeColMax_bindGroup = ctx.webgpuDevice.createBindGroup({
-		layout: ctx.executeColMax_pipeline.getBindGroupLayout(0),
-			entries: [
-				{ binding: 0, resource: { buffer: ctx.preBuffers.ktq } },
-				{ binding: 1, resource: { buffer: ctx.rightEndIndexBuffer } },			
-				{ binding: 2, resource: { buffer: ctx.preBuffers.colMax } },
-			],
-		});
 	}
 
+	const bindGroup = ctx.webgpuDevice.createBindGroup({
+		layout: ctx.executeColMax_pipeline.getBindGroupLayout(0),
+		entries: [
+			{ binding: 0, resource: { buffer: ctx.preBuffersByTransformer[tIndex].ktq } },
+			{ binding: 1, resource: { buffer: ctx.rightEndIndexBuffer } },
+			{ binding: 2, resource: { buffer: ctx.firstIterationBuffer } },
+			{ binding: 3, resource: { buffer: ctx.preBuffersByTransformer[tIndex].colMax } },
+		],
+	});
+
 	passEncoder.setPipeline(ctx.executeColMax_pipeline);
-	passEncoder.setBindGroup(0, ctx.executeColMax_bindGroup);
+	passEncoder.setBindGroup(0, bindGroup);
 	passEncoder.dispatchWorkgroups(Math.ceil(L * heads / 32));
 
-	return { buffer: ctx.preBuffers.colMax };
+	return { buffer: ctx.preBuffersByTransformer[tIndex].colMax };
 }
 
-globalThis.executeColSum = (ctx, heads, L, shaderCode) => {
+globalThis.executeColSum = (ctx, heads, L, shaderCode, tIndex) => {
 	if (!ctx.executeColSum_pipeline) {
 		const shaderModule = ctx.webgpuDevice.createShaderModule({ code: shaderCode });
 	
@@ -536,26 +562,27 @@ globalThis.executeColSum = (ctx, heads, L, shaderCode) => {
 			layout: 'auto',
 			compute: { module: shaderModule, entryPoint: 'main' },
 		});
-
-		ctx.executeColSum_bindGroup = ctx.webgpuDevice.createBindGroup({
-			layout: ctx.executeColSum_pipeline.getBindGroupLayout(0),
-			entries: [
-				{ binding: 0, resource: { buffer: ctx.preBuffers.ktq } },
-				{ binding: 1, resource: { buffer: ctx.preBuffers.colMax } },
-				{ binding: 2, resource: { buffer: ctx.rightEndIndexBuffer } },			
-				{ binding: 3, resource: { buffer: ctx.preBuffers.colSum } },
-			],
-		});
 	}
 
+	const bindGroup = ctx.webgpuDevice.createBindGroup({
+		layout: ctx.executeColSum_pipeline.getBindGroupLayout(0),
+		entries: [
+			{ binding: 0, resource: { buffer: ctx.preBuffersByTransformer[tIndex].ktq } },
+			{ binding: 1, resource: { buffer: ctx.preBuffersByTransformer[tIndex].colMax } },
+			{ binding: 2, resource: { buffer: ctx.rightEndIndexBuffer } },
+			{ binding: 3, resource: { buffer: ctx.firstIterationBuffer } },
+			{ binding: 4, resource: { buffer: ctx.preBuffersByTransformer[tIndex].colSum } },
+		],
+	});
+
 	passEncoder.setPipeline(ctx.executeColSum_pipeline);
-	passEncoder.setBindGroup(0, ctx.executeColSum_bindGroup);
+	passEncoder.setBindGroup(0, bindGroup);
 	passEncoder.dispatchWorkgroups(Math.ceil(L * heads / 32));
 
-	return { buffer: ctx.preBuffers.colSum };
+	return { buffer: ctx.preBuffersByTransformer[tIndex].colSum };
 }
 
-globalThis.executeSoftmaxByHead = (ctx, heads, shaderCode) => {
+globalThis.executeSoftmaxByHead = (ctx, heads, shaderCode, tIndex) => {
 	if (!ctx.executeSoftmaxByHead_pipeline) {
 		const shaderModule = ctx.webgpuDevice.createShaderModule({ code: shaderCode });
 	
@@ -563,31 +590,32 @@ globalThis.executeSoftmaxByHead = (ctx, heads, shaderCode) => {
 			layout: 'auto',
 			compute: { module: shaderModule, entryPoint: 'main' },
 		});
-
-		ctx.executeSoftmaxByHead_bindGroup = ctx.webgpuDevice.createBindGroup({
-			layout: ctx.executeSoftmaxByHead_pipeline.getBindGroupLayout(0),
-			entries: [
-				{ binding: 0, resource: { buffer: ctx.preBuffers.ktq } },
-				{ binding: 1, resource: { buffer: ctx.preBuffers.colMax } },
-				{ binding: 2, resource: { buffer: ctx.preBuffers.colSum } },
-				{ binding: 3, resource: { buffer: ctx.rightEndIndexBuffer } },				
-				{ binding: 4, resource: { buffer: ctx.preBuffers.softmax } },
-			],
-		});
 	}
 
+	const bindGroup = ctx.webgpuDevice.createBindGroup({
+		layout: ctx.executeSoftmaxByHead_pipeline.getBindGroupLayout(0),
+		entries: [
+			{ binding: 0, resource: { buffer: ctx.preBuffersByTransformer[tIndex].ktq } },
+			{ binding: 1, resource: { buffer: ctx.preBuffersByTransformer[tIndex].colMax } },
+			{ binding: 2, resource: { buffer: ctx.preBuffersByTransformer[tIndex].colSum } },
+			{ binding: 3, resource: { buffer: ctx.rightEndIndexBuffer } },
+			{ binding: 4, resource: { buffer: ctx.firstIterationBuffer } },						
+			{ binding: 5, resource: { buffer: ctx.preBuffersByTransformer[tIndex].softmax } },
+		],
+	});
+
 	passEncoder.setPipeline(ctx.executeSoftmaxByHead_pipeline);
-	passEncoder.setBindGroup(0, ctx.executeSoftmaxByHead_bindGroup);
+	passEncoder.setBindGroup(0, bindGroup);
 	passEncoder.dispatchWorkgroups(
-		Math.ceil(globalThis.LSequence / 8), 
+		Math.ceil(globalThis.postFirstIteration ? 1 : globalThis.LSequence / 8), 
 		Math.ceil(globalThis.LSequence / 8), 
 		heads
 	);
 
-	return { buffer: ctx.preBuffers.softmax };
+	return { buffer: ctx.preBuffersByTransformer[tIndex].softmax };
 };
 
-globalThis.executeMatMulValsAttention = (ctx, headDim, heads, shaderCode) => {
+globalThis.executeMatMulValsAttention = (ctx, headDim, heads, shaderCode, tIndex) => {
 	if (!ctx.executeMatMulValsAttention_pipeline) {
 		const shaderModule = ctx.webgpuDevice.createShaderModule({ code: shaderCode });
 		
@@ -595,26 +623,28 @@ globalThis.executeMatMulValsAttention = (ctx, headDim, heads, shaderCode) => {
 			layout: 'auto',
 			compute: { module: shaderModule, entryPoint: 'main' },
 		});
-
-		ctx.executeMatMulValsAttention_bindGroup = ctx.webgpuDevice.createBindGroup({
-			layout: ctx.executeMatMulValsAttention_pipeline.getBindGroupLayout(0),
-			entries: [
-				{ binding: 0, resource: { buffer: ctx.preBuffers.matMulV } },
-				{ binding: 1, resource: { buffer: ctx.preBuffers.softmax } },
-				{ binding: 2, resource: { buffer: ctx.preBuffers.valsAttention } },
-			],
-		});
 	}
+
+	ctx.executeMatMulValsAttention_bindGroup = ctx.webgpuDevice.createBindGroup({
+		layout: ctx.executeMatMulValsAttention_pipeline.getBindGroupLayout(0),
+		entries: [
+			{ binding: 0, resource: { buffer: ctx.preBuffersByTransformer[tIndex].matMulV } },
+			{ binding: 1, resource: { buffer: ctx.preBuffersByTransformer[tIndex].softmax } },
+			{ binding: 2, resource: { buffer: ctx.rightEndIndexBuffer } },
+			{ binding: 3, resource: { buffer: ctx.firstIterationBuffer } },			
+			{ binding: 4, resource: { buffer: ctx.preBuffersByTransformer[tIndex].valsAttention } },
+		],
+	});
 
 	passEncoder.setPipeline(ctx.executeMatMulValsAttention_pipeline);
 	passEncoder.setBindGroup(0, ctx.executeMatMulValsAttention_bindGroup);
 	
-	const workgroupsX = Math.ceil(globalThis.LSequence / 8);
+	const workgroupsX = Math.ceil(globalThis.postFirstIteration ? 1 : globalThis.LSequence / 8);
 	const workgroupsY = Math.ceil(headDim / 8);
 	const workgroupsZ = heads;
 	passEncoder.dispatchWorkgroups(workgroupsX, workgroupsY, workgroupsZ);
 
-	return { buffer: ctx.preBuffers.valsAttention };
+	return { buffer: ctx.preBuffersByTransformer[tIndex].valsAttention };
 };
 
 // TODO: clean signature, some params not longer needed

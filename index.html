@@ -2388,7 +2388,7 @@
             console.log(`Running teacher-forced inference with ${inputTokens.length} tokens`);
             
             // Run the model
-            lmNetwork.runQueryThroughModel(inputTokens, null);
+            lmNetwork.runQueryThroughModel(inputTokens);
 
             const logitScoresPostSoftmaxRowMajorFlat = await globalThis.readFloat32Buffer(lmNetwork, lmNetwork.logitScoresByInputTokenPostSoftmax.buffer, SEQUENCE_LENGTH * lmNetwork.vocabSize * 4);
             console.log(logitScoresPostSoftmaxRowMajorFlat);
@@ -2543,8 +2543,13 @@
                 // Rest 200ms before inference
                 // await new Promise(resolve => setTimeout(resolve, 200));
                 
+                const startInferenceCycle = performance.now();
+
                 // Run inference in free inference mode (teacherMode = false)
-                lmNetwork.runQueryThroughModel(currentTokens, null, false, rightEndIndex);
+                lmNetwork.runQueryThroughModel(currentTokens, false, rightEndIndex, iteration > 0);
+
+                const endInferenceCycle = performance.now();
+		        console.log(`GPU Inference Execution time: ${endInferenceCycle - startInferenceCycle} ms`);
                 
                 const rightEndPredictionsRowMajorFlat = await globalThis.readFloat32Buffer(lmNetwork, lmNetwork.rightEndIndexTokenSoftmaxPredictions.buffer, 2 * lmNetwork.vocabSize * 4);
 
@@ -2989,11 +2994,15 @@
                 
                 // Rest 200ms before inference
                 // await new Promise(resolve => setTimeout(resolve, 200));
-                
-                lmNetwork.runQueryThroughModel(currentTokens, null, false, rightEndIndex);
+                const startInferenceCycle = performance.now();
+
+                lmNetwork.runQueryThroughModel(currentTokens, false, rightEndIndex);
 
                 // Run inference in free inference mode
                 const rightEndPredictionsRowMajorFlat = await globalThis.readFloat32Buffer(lmNetwork, lmNetwork.rightEndIndexTokenSoftmaxPredictions.buffer, 2 * lmNetwork.vocabSize * 4);
+
+		        const endInferenceCycle = performance.now();
+		        console.log(`GPU Inference Execution time: ${endInferenceCycle - startInferenceCycle} ms`);
 
                 const rightEndPredictions = [];
                 for (let vocabIndex = 0; vocabIndex < lmNetwork.vocabSize; vocabIndex++) {
